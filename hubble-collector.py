@@ -1,67 +1,93 @@
 #!/usr/bin/env python3
 """
-Hubble Network Flow Collector
-Собирает сетевые взаимодействия между подами через Hubble CLI
-и генерирует CiliumNetworkPolicy на основе реального трафика
+Hubble flow collector с генерацией CiliumNetworkPolicy
 
-Примеры использования:
-    # Базовый сбор flows
+Использование:
     python3 hubble-collector.py -n production -o flows.json
-
-    # Генерация CiliumNetworkPolicy
-    python3 hubble-collector.py -n production -o flows.json \
-        --cilium true --cilium-output-dir ./policies
-
-    # С фильтрацией по приложению
-    python3 hubble-collector.py -n production -o flows.json \
-        --from-label "app=backend-api" \
-        --cilium true
-
-Зависимости:
-    - hubble CLI (должен быть установлен)
-    - PyYAML (для генерации CiliumNetworkPolicy): pip install pyyaml
+    python3 hubble-collector.py -n prod -o flows.json --cilium true
 """
 
 import json
 import argparse
 import sys
 import re
+import ipaddress
 from datetime import datetime
 from collections import defaultdict
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Set, Tuple, Optional
 import subprocess
 
 
 class HubbleCollector:
-    """Сборщик сетевых flows из Hubble"""
     
-    def __init__(self, namespace: str, from_label: str = None, to_label: str = None, verdict: str = None):
+    DEFAULT_PORTS = {
+        'rabbitmq': {'port': '5672', 'protocol': 'TCP'},
+        'rabbitmq-management': {'port': '15672', 'protocol': 'TCP'},
+        'redis': {'port': '6379', 'protocol': 'TCP'},
+        'redis-sentinel': {'port': '26379', 'protocol': 'TCP'},
+        'postgresql': {'port': '5432', 'protocol': 'TCP'},
+        'postgres': {'port': '5432', 'protocol': 'TCP'},
+        'vmagent': {'port': '8429', 'protocol': 'TCP'},
+        'victoria-metrics': {'port': '8428', 'protocol': 'TCP'},
+        'vmsingle': {'port': '8429', 'protocol': 'TCP'},
+        'vmselect': {'port': '8481', 'protocol': 'TCP'},
+        'vminsert': {'port': '8480', 'protocol': 'TCP'},
+        'vmstorage': {'port': '8482', 'protocol': 'TCP'},
+        'prometheus': {'port': '9090', 'protocol': 'TCP'},
+        'alertmanager': {'port': '9093', 'protocol': 'TCP'},
+        'grafana': {'port': '3000', 'protocol': 'TCP'},
+        'kube-dns': {'port': '53', 'protocol': 'UDP'},
+        'coredns': {'port': '53', 'protocol': 'UDP'},
+    }
+    
+    def __init__(self, namespace: str, from_label: str = None, to_label: str = None, verdict: str = None,
+                 pod_cidr: str = None, service_cidr: str = None):
         self.namespace = namespace
         self.from_label = from_label
         self.to_label = to_label
         self.verdict = verdict
         self.flows = []
-        self.connections = defaultdict(lambda: defaultdict(int))  # source -> {destination: count}
-        self.pod_labels = {}  # pod_name -> labels dict
-        self.flow_details = defaultdict(lambda: defaultdict(list))  # source -> {destination: [flow_details]}
-        self.ip_to_pod = {}  # ip -> (pod_name, namespace) маппинг для определения подов по IP
+        self.connections = defaultdict(lambda: defaultdict(int))
+        self.pod_labels = {}
+        self.flow_details = defaultdict(lambda: defaultdict(list))
+        self.ip_to_pod = {}
+        self.internal_networks = []
+        
+        if pod_cidr:
+            try:
+                self.internal_networks.append(ipaddress.ip_network(pod_cidr))
+            except ValueError as e:
+                print(f"Warning: invalid pod_cidr '{pod_cidr}': {e}")
+        
+        if service_cidr:
+            try:
+                self.internal_networks.append(ipaddress.ip_network(service_cidr))
+            except ValueError as e:
+                print(f"Warning: invalid service_cidr '{service_cidr}': {e}")
+        
+        if not self.internal_networks:
+            # Дефолтные CIDR если не указаны явно
+            self.internal_networks = [
+                ipaddress.ip_network('10.39.0.0/16'),    # Pod CIDR
+                ipaddress.ip_network('10.40.0.0/16'),    # Service CIDR
+                ipaddress.ip_network('172.16.0.0/12'),   
+                ipaddress.ip_network('192.168.0.0/16'), 
+                ipaddress.ip_network('100.64.0.0/10'),   # Shared address space
+            ]
         
     def collect_flows(self, duration: int = 60, follow: bool = False):
-        """Собрать flows через hubble CLI"""
         cmd = [
             "hubble", "observe", "flows",
             "--namespace", self.namespace,
             "--output", "json",
         ]
         
-        # Добавляем фильтры по лейблам
         if self.from_label:
             cmd.extend(["--from-label", self.from_label])
         
         if self.to_label:
             cmd.extend(["--to-label", self.to_label])
         
-        # Фильтр по verdict
         if self.verdict:
             cmd.extend(["--verdict", self.verdict.upper()])
         
@@ -103,7 +129,6 @@ class HubbleCollector:
             print("\nОстановка...")
     
     def _process_flow(self, flow: Dict):
-        """Обработать один flow"""
         try:
             if 'flow' not in flow:
                 return
@@ -112,7 +137,6 @@ class HubbleCollector:
             source = flow_data.get('source', {})
             destination = flow_data.get('destination', {})
             
-            # IP-адреса находятся в верхнем уровне
             ip_info = flow_data.get('IP', {})
             source_ip = ip_info.get('source', 'unknown')
             dest_ip = ip_info.get('destination', 'unknown')
@@ -123,13 +147,12 @@ class HubbleCollector:
             if source_ns != self.namespace and dest_ns != self.namespace:
                 return
             
-            # Сохраняем labels для подов и маппинг IP -> Pod
+            # Сохраняем labels и IP маппинг
             source_pod_name = source.get('pod_name')
             if source_pod_name and source_ns:
                 source_labels = source.get('labels', [])
                 if source_labels:
                     self.pod_labels[source_pod_name] = self._parse_labels(source_labels)
-                # Сохраняем маппинг IP -> Pod
                 if source_ip != 'unknown':
                     self.ip_to_pod[source_ip] = (source_pod_name, source_ns)
             
@@ -138,14 +161,12 @@ class HubbleCollector:
                 dest_labels = destination.get('labels', [])
                 if dest_labels:
                     self.pod_labels[dest_pod_name] = self._parse_labels(dest_labels)
-                # Сохраняем маппинг IP -> Pod
                 if dest_ip != 'unknown':
                     self.ip_to_pod[dest_ip] = (dest_pod_name, dest_ns)
             
-            # Получаем информацию об источнике
+            # Формируем source
             source_pod = source.get('pod_name')
             if not source_pod:
-                # Пытаемся получить имя из workload
                 workloads = source.get('workloads', [])
                 if workloads and isinstance(workloads, list) and len(workloads) > 0:
                     workload = workloads[0]
@@ -159,7 +180,6 @@ class HubbleCollector:
                     else:
                         source_pod = f"{source_ip}"
                 else:
-                    # Проверяем labels
                     source_labels = source.get('labels', [])
                     source_info = []
                     for label in source_labels:
@@ -171,7 +191,7 @@ class HubbleCollector:
                     else:
                         source_pod = f"{source_ip}"
             
-            # Получаем информацию о назначении
+            # Формируем destination
             dest_pod = destination.get('pod_name')
             dest_port = destination.get('port')
             l4_proto = flow_data.get('l4', {})
@@ -181,14 +201,11 @@ class HubbleCollector:
                 dest_identity = destination.get('identity')
                 dest_labels = []
                 
-                # Проверяем, что identity - это словарь
                 if isinstance(dest_identity, dict):
                     dest_labels = dest_identity.get('labels', [])
                 elif isinstance(dest_identity, int):
-                    # Если identity число, проверяем labels на верхнем уровне
                     dest_labels = destination.get('labels', [])
                 
-                # Пытаемся получить имя из workload
                 workloads = destination.get('workloads', [])
                 if workloads and isinstance(workloads, list) and len(workloads) > 0:
                     workload = workloads[0]
@@ -198,25 +215,20 @@ class HubbleCollector:
                             dest_pod = workload_name
                 
                 if not dest_pod:
-                    # Пытаемся получить имя сервиса
                     service_name = destination.get('service', {}).get('name') if isinstance(destination.get('service'), dict) else None
                     dest_ns_name = destination.get('namespace')
                     
-                    # Извлекаем порт из l4 если нет в destination
                     if not dest_port and l4_proto:
                         proto_data = list(l4_proto.values())[0] if l4_proto else {}
                         dest_port = proto_data.get('destination_port') if isinstance(proto_data, dict) else None
                     
-                    # Пытаемся получить DNS имя или другую полезную информацию
                     dest_info = []
                     for label in dest_labels:
                         if 'reserved:' in label:
-                            # reserved:host, reserved:world, reserved:init и т.д.
                             dest_info.append(label.replace('reserved:', ''))
                         elif 'cidr:' in label:
                             dest_info.append(label.split('=')[1] if '=' in label else label)
                     
-                    # Формируем имя назначения
                     if service_name and dest_ns_name:
                         dest_pod = f"{service_name}.{dest_ns_name}:{dest_port or '?'}/{protocol}"
                     elif service_name:
@@ -235,10 +247,10 @@ class HubbleCollector:
             if source_pod and dest_pod and source_pod != dest_pod:
                 self.connections[source_pod][dest_pod] += 1
                 
-                # Сохраняем детали flow для создания политик
                 flow_detail = {
                     'source_pod': source_pod_name,
                     'source_ns': source_ns,
+                    'source_ip': source_ip,
                     'dest_pod': dest_pod_name,
                     'dest_ns': dest_ns,
                     'dest_ip': dest_ip,
@@ -250,10 +262,10 @@ class HubbleCollector:
                 self.flow_details[source_pod][dest_pod].append(flow_detail)
                 
         except Exception as e:
-            print(f"  Ошибка обработки flow: {e}", file=sys.stderr)
+            print(f"  Error processing flow: {e}", file=sys.stderr)
     
     def _parse_labels(self, labels_list: List[str]) -> Dict[str, str]:
-        """Конвертировать список labels в словарь, исключая служебные Cilium labels"""
+        """Фильтрует служебные labels"""
         labels = {}
         exclude_prefixes = [
             'io.cilium.',
@@ -267,16 +279,23 @@ class HubbleCollector:
             if '=' in label and not label.startswith('reserved:'):
                 key, value = label.split('=', 1)
                 
-                # Пропускаем служебные Cilium и Kubernetes labels
+
+                if key.startswith('k8s:'):
+                    key = key[4:]  
+                
                 if any(key.startswith(prefix) for prefix in exclude_prefixes):
                     continue
                 
-                # Пропускаем labels с namespace metadata (создаются Cilium автоматически)
                 if 'k8s.namespace.labels' in key:
                     continue
                 
-                # Пропускаем cluster и policy labels
                 if key in ['k8s.policy.cluster', 'k8s.policy.serviceaccount']:
+                    continue
+                
+                if key.startswith('io.cilium.k8s.policy'):
+                    continue
+                
+                if key == 'io.kubernetes.pod.namespace':
                     continue
                 
                 labels[key] = value
@@ -284,38 +303,52 @@ class HubbleCollector:
         return labels
     
     def _is_external_ip(self, ip: str) -> bool:
-        """Определить является ли IP внешним (не внутри кластера)"""
+        """Проверка внешнего IP"""
         if ip == 'unknown':
             return False
         
-        # Проверяем частные сети (RFC 1918)
-        if ip.startswith('10.'):
-            return False
-        if ip.startswith('172.'):
-            # 172.16.0.0 - 172.31.255.255
-            second_octet = int(ip.split('.')[1])
-            if 16 <= second_octet <= 31:
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+            
+            if ip_obj.is_loopback:
                 return False
-        if ip.startswith('192.168.'):
+            
+            if ip_obj.is_link_local:
+                return False
+            
+            for network in self.internal_networks:
+                if ip_obj in network:
+                    return False
+            
+            return True
+            
+        except ValueError:
             return False
+    
+    def _get_default_port(self, labels: Dict[str, str]) -> Optional[Dict[str, str]]:
+        """Определяем дефолтный порт по labels компонента"""
+        if not labels:
+            return None
         
-        # Loopback
-        if ip.startswith('127.'):
-            return False
+        app_name = labels.get('app', '').lower()
+        app_k8s_name = labels.get('app.kubernetes.io/name', '').lower()
+        app_component = labels.get('app.kubernetes.io/component', '').lower()
+        k8s_app = labels.get('k8s-app', '').lower()
         
-        # Link-local
-        if ip.startswith('169.254.'):
-            return False
+        check_names = [app_name, app_k8s_name, app_component, k8s_app]
         
-        # Kubernetes service CIDR (часто 100.64.x.x или другие)
-        if ip.startswith('100.64.'):
-            return False
+        for name in check_names:
+            if name in self.DEFAULT_PORTS:
+                return self.DEFAULT_PORTS[name]
         
-        # Все остальное считаем внешним
-        return True
+        for name in check_names:
+            for key in self.DEFAULT_PORTS.keys():
+                if key in name or name in key:
+                    return self.DEFAULT_PORTS[key]
+        
+        return None
     
     def export_to_json(self, filepath: str):
-        """Экспорт в JSON"""
         data = {
             'namespace': self.namespace,
             'collected_at': datetime.utcnow().isoformat(),
@@ -369,72 +402,95 @@ class HubbleCollector:
         print("="*70)
     
     def export_cilium_policies(self, output_dir: str):
-        """Экспорт в CiliumNetworkPolicy"""
         import os
         import yaml
         
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
         
-        # Группируем политики по source pod
         policies_by_pod = defaultdict(lambda: {
-            'egress': defaultdict(lambda: {'ports': set(), 'protocols': set()})
+            'egress': defaultdict(lambda: {'ports': set(), 'protocols': set()}),
+            'ingress': defaultdict(lambda: {'ports': set(), 'protocols': set()})
         })
         
         for source_display, destinations in self.flow_details.items():
             for dest_display, flow_list in destinations.items():
                 for flow in flow_list:
                     source_pod = flow.get('source_pod')
-                    if not source_pod or flow.get('source_ns') != self.namespace:
-                        continue
-                    
+                    source_ns = flow.get('source_ns')
+                    source_ip = flow.get('source_ip')
                     dest_pod = flow.get('dest_pod')
                     dest_ns = flow.get('dest_ns')
                     dest_ip = flow.get('dest_ip')
                     dest_port = flow.get('dest_port')
                     protocol = flow.get('protocol')
                     
-                    # Определяем тип назначения
-                    if dest_pod and dest_ns:
-                        # Pod to Pod - известен конкретный pod
-                        dest_key = f"pod:{dest_ns}/{dest_pod}"
-                    elif dest_ns:
-                        # Namespace известен, но pod нет
-                        dest_key = f"ns:{dest_ns}"
-                    elif dest_ip and dest_ip != 'unknown':
-                        # Проверяем есть ли этот IP в маппинге (значит это внутренний pod)
-                        if dest_ip in self.ip_to_pod:
-                            pod_info = self.ip_to_pod[dest_ip]
-                            dest_key = f"pod:{pod_info[1]}/{pod_info[0]}"  # namespace/pod_name
-                        elif self._is_external_ip(dest_ip):
-                            # Внешний IP
-                            dest_key = f"external:{dest_ip}"
+                    if source_pod and source_ns == self.namespace:
+                        if dest_pod and dest_ns:
+                            dest_key = f"pod:{dest_ns}/{dest_pod}"
+                        elif dest_ns:
+                            dest_key = f"ns:{dest_ns}"
+                        elif dest_ip and dest_ip != 'unknown':
+                            if dest_ip in self.ip_to_pod:
+                                pod_info = self.ip_to_pod[dest_ip]
+                                dest_key = f"pod:{pod_info[1]}/{pod_info[0]}"
+                            elif self._is_external_ip(dest_ip):
+                                dest_key = f"external:{dest_ip}"
+                            else:
+                                print(f"  Warning: unknown internal IP {dest_ip} (port {dest_port}) - pod may have been deleted")
+                                continue
                         else:
-                            # Внутренний IP без информации о поде - используем toEntities
-                            dest_key = f"internal:{dest_ip}"
-                    else:
-                        # Неизвестное назначение - пропускаем
-                        continue
+                            continue
+                        
+                        if dest_port:
+                            policies_by_pod[source_pod]['egress'][dest_key]['ports'].add(str(dest_port))
+                        if protocol:
+                            policies_by_pod[source_pod]['egress'][dest_key]['protocols'].add(protocol)
                     
-                    if dest_port:
-                        policies_by_pod[source_pod]['egress'][dest_key]['ports'].add(str(dest_port))
-                    if protocol:
-                        policies_by_pod[source_pod]['egress'][dest_key]['protocols'].add(protocol)
+                    if dest_pod and dest_ns == self.namespace:
+                        if source_pod and source_ns:
+                            source_key = f"pod:{source_ns}/{source_pod}"
+                        elif source_ns:
+                            source_key = f"ns:{source_ns}"
+                        elif source_ip and source_ip != 'unknown':
+                            if source_ip in self.ip_to_pod:
+                                pod_info = self.ip_to_pod[source_ip]
+                                source_key = f"pod:{pod_info[1]}/{pod_info[0]}"
+                            elif self._is_external_ip(source_ip):
+                                source_key = f"external:{source_ip}"
+                            else:
+                                print(f"  Warning: unknown internal source IP {source_ip} - pod may have been deleted")
+                                continue
+                        else:
+                            continue
+                        
+                        if dest_port:
+                            policies_by_pod[dest_pod]['ingress'][source_key]['ports'].add(str(dest_port))
+                        if protocol:
+                            policies_by_pod[dest_pod]['ingress'][source_key]['protocols'].add(protocol)
         
-        # Создаём файлы политик для каждого пода
         policy_files = []
         for pod_name, policy_data in policies_by_pod.items():
-            # Получаем labels для пода
             pod_labels = self.pod_labels.get(pod_name, {})
             if not pod_labels:
-                # Пытаемся извлечь из имени пода основные labels
                 pod_labels = self._extract_labels_from_pod_name(pod_name)
             
             if not pod_labels:
-                print(f"Пропускаем pod '{pod_name}' - нет labels для селектора")
+                print(f"Skip pod '{pod_name}' - нет labels")
                 continue
             
-            # Создаём CiliumNetworkPolicy
+
+            if any(k.startswith('k8s:') or k.startswith('io.cilium') or k.startswith('io.kubernetes.pod') 
+                   for k in pod_labels.keys()):
+                print(f"Warning: pod '{pod_name}' has invalid labels: {pod_labels}")
+
+                pod_labels = {k: v for k, v in pod_labels.items() 
+                             if not k.startswith('k8s:') 
+                             and not k.startswith('io.cilium') 
+                             and not k.startswith('io.kubernetes.pod')}
+                if not pod_labels:
+                    print(f"Skip pod '{pod_name}' - все labels служебные")
+                    continue
             policy = {
                 'apiVersion': 'cilium.io/v2',
                 'kind': 'CiliumNetworkPolicy',
@@ -449,83 +505,156 @@ class HubbleCollector:
                     'egress': []
                 }
             }
-            
-            # Добавляем egress rules
             for dest_key, dest_info in policy_data['egress'].items():
                 dest_type, dest_value = dest_key.split(':', 1)
                 
                 egress_rule = {}
+                dest_pod_labels = {}
                 
                 if dest_type == 'pod':
-                    # Pod to Pod
                     dest_ns, dest_pod = dest_value.split('/', 1)
                     dest_pod_labels = self.pod_labels.get(dest_pod, {})
                     
                     if dest_pod_labels:
                         egress_rule['toEndpoints'] = [{
-                            'matchLabels': dest_pod_labels
+                            'matchLabels': dict(dest_pod_labels)
                         }]
                     else:
-                        # Fallback к namespace
                         egress_rule['toEndpoints'] = [{
                             'matchExpressions': [{
-                                'key': 'k8s:io.kubernetes.pod.namespace',
+                                'key': 'io.kubernetes.pod.namespace',
                                 'operator': 'In',
                                 'values': [dest_ns]
                             }]
                         }]
                 
                 elif dest_type == 'ns':
-                    # Namespace
                     egress_rule['toEndpoints'] = [{
                         'matchExpressions': [{
-                            'key': 'k8s:io.kubernetes.pod.namespace',
+                            'key': 'io.kubernetes.pod.namespace',
                             'operator': 'In',
                             'values': [dest_value]
                         }]
                     }]
                 
                 elif dest_type == 'external':
-                    # Только внешние IP используют toCIDR
                     egress_rule['toCIDR'] = [f"{dest_value}/32"]
                 
-                elif dest_type == 'internal':
-                    # Внутренний IP без информации о поде - используем toEntities
-                    egress_rule['toEntities'] = ['cluster']
+                else:
+                    continue
                 
-                # Добавляем порты
-                if dest_info['ports'] or dest_info['protocols']:
+                if not dest_info['ports'] or not dest_info['protocols']:
+                    default_port_info = self._get_default_port(dest_pod_labels)
+                    if default_port_info:
+                        dest_info['ports'].add(default_port_info['port'])
+                        dest_info['protocols'].add(default_port_info['protocol'])
+                        print(f"  Using default port {default_port_info['port']}/{default_port_info['protocol']} for {dest_key}")
+                
+                if dest_info['ports'] and dest_info['protocols']:
                     egress_rule['toPorts'] = []
-                    
-                    protocols_list = list(dest_info['protocols']) if dest_info['protocols'] else ['TCP']
+                    protocols_list = list(dest_info['protocols'])
                     
                     for protocol in protocols_list:
                         port_rule = {'protocol': protocol.upper()}
-                        
-                        if dest_info['ports']:
-                            port_rule['ports'] = [{'port': port} for port in sorted(dest_info['ports'])]
-                        
+                        port_rule['ports'] = [{'port': port} for port in sorted(dest_info['ports'])]
                         egress_rule['toPorts'].append(port_rule)
                 
-                if egress_rule:
+                if egress_rule and (dest_info['ports'] or 'toCIDR' in egress_rule):
                     policy['spec']['egress'].append(egress_rule)
             
-            # DNS разрешение (добавляем по умолчанию)
-            dns_rule = {
-                'toEndpoints': [{
-                    'matchLabels': {
-                        'k8s:io.kubernetes.pod.namespace': 'kube-system',
-                        'k8s:k8s-app': 'kube-dns'
-                    }
-                }],
-                'toPorts': [{
-                    'protocol': 'UDP',
-                    'ports': [{'port': '53'}]
-                }]
-            }
-            policy['spec']['egress'].append(dns_rule)
+            if policy_data['ingress']:
+                policy['spec']['ingress'] = []
+                
+                for source_key, source_info in policy_data['ingress'].items():
+                    source_type, source_value = source_key.split(':', 1)
+                    
+                    ingress_rule = {}
+                    source_pod_labels = {}
+                    
+                    if source_type == 'pod':
+                        source_ns, source_pod = source_value.split('/', 1)
+                        source_pod_labels = self.pod_labels.get(source_pod, {})
+                        
+                        if source_pod_labels:
+                            ingress_rule['fromEndpoints'] = [{
+                                'matchLabels': dict(source_pod_labels)
+                            }]
+                        else:
+                            ingress_rule['fromEndpoints'] = [{
+                                'matchExpressions': [{
+                                    'key': 'io.kubernetes.pod.namespace',
+                                    'operator': 'In',
+                                    'values': [source_ns]
+                                }]
+                            }]
+                    
+                    elif source_type == 'ns':
+                        ingress_rule['fromEndpoints'] = [{
+                            'matchExpressions': [{
+                                'key': 'io.kubernetes.pod.namespace',
+                                'operator': 'In',
+                                'values': [source_value]
+                            }]
+                        }]
+                    
+                    elif source_type == 'external':
+                        ingress_rule['fromCIDR'] = [f"{source_value}/32"]
+                    
+                    else:
+                        continue
+                    
+                    if not source_info['ports'] or not source_info['protocols']:
+                        default_port_info = self._get_default_port(source_pod_labels)
+                        if default_port_info:
+                            source_info['ports'].add(default_port_info['port'])
+                            source_info['protocols'].add(default_port_info['protocol'])
+                            print(f"  Using default port {default_port_info['port']}/{default_port_info['protocol']} for ingress from {source_key}")
+                    
+                    if source_info['ports'] and source_info['protocols']:
+                        ingress_rule['toPorts'] = []
+                        protocols_list = list(source_info['protocols'])
+                        
+                        for protocol in protocols_list:
+                            port_rule = {'protocol': protocol.upper()}
+                            port_rule['ports'] = [{'port': port} for port in sorted(source_info['ports'])]
+                            ingress_rule['toPorts'].append(port_rule)
+                    
+                    if ingress_rule and (source_info['ports'] or 'fromCIDR' in ingress_rule):
+                        policy['spec']['ingress'].append(ingress_rule)
             
-            # Сохраняем в файл
+            has_dns_rule = any(
+                'toEndpoints' in rule and 
+                any(
+                    ep.get('matchLabels', {}).get('k8s-app') == 'kube-dns' or
+                    ep.get('matchLabels', {}).get('k8s-app') == 'coredns'
+                    for ep in rule.get('toEndpoints', [])
+                )
+                for rule in policy['spec']['egress']
+            )
+            
+            if not has_dns_rule:
+                dns_rule = {
+                    'toEndpoints': [{
+                        'matchLabels': {
+                            'io.kubernetes.pod.namespace': 'kube-system',
+                            'k8s-app': 'kube-dns'
+                        }
+                    }],
+                    'toPorts': [{
+                        'protocol': 'UDP',
+                        'ports': [{'port': '53'}]
+                    }]
+                }
+                policy['spec']['egress'].append(dns_rule)
+            
+            # Validate policy
+            is_valid, error = self._validate_policy(policy)
+            if not is_valid:
+                print(f"ОШИБКА валидации политики '{pod_name}': {error}")
+                print(f"Политика пропущена. Проверь flows для этого пода.")
+                continue
+            
+            # Save to file
             filename = f"{self._sanitize_name(pod_name)}-cnp.yaml"
             filepath = os.path.join(output_dir, filename)
             
@@ -533,57 +662,121 @@ class HubbleCollector:
                 yaml.dump(policy, f, default_flow_style=False, sort_keys=False)
             
             policy_files.append(filepath)
-            print(f"Создана политика: {filepath}")
+            
+            egress_count = len(policy['spec'].get('egress', []))
+            ingress_count = len(policy['spec'].get('ingress', []))
+            print(f"Создана политика: {filepath} (egress: {egress_count} rules, ingress: {ingress_count} rules)")
         
         return policy_files
     
     def _sanitize_name(self, name: str) -> str:
-        """Очистить имя для использования в Kubernetes"""
-        # Убираем хеш deployment/replicaset из имени
+        """Очистка имени для Kubernetes"""
+        # Убираем хеш из имени
         name = re.sub(r'-[a-f0-9]{8,10}-[a-z0-9]{5}$', '', name)
         name = re.sub(r'-[a-f0-9]{9,10}$', '', name)
         
-        # Заменяем недопустимые символы
         name = re.sub(r'[^a-z0-9-]', '-', name.lower())
         name = re.sub(r'-+', '-', name)
         name = name.strip('-')
         
-        # Ограничиваем длину
         if len(name) > 63:
             name = name[:63].rstrip('-')
         
         return name
     
     def _extract_labels_from_pod_name(self, pod_name: str) -> Dict[str, str]:
-        """Попытка извлечь labels из имени пода"""
-        # Убираем хеш и индекс пода
+        """Извлекаем app label из имени пода"""
+        # Убираем хеш и индекс
         base_name = re.sub(r'-[a-f0-9]{8,10}-[a-z0-9]{5}$', '', pod_name)
         base_name = re.sub(r'-[a-f0-9]{9,10}$', '', base_name)
         base_name = re.sub(r'-\d+$', '', base_name)
         
         if base_name and base_name != pod_name:
-            return {
-                'app': base_name
-            }
+            return {'app': base_name}
         
         return {}
 
+    def _validate_policy(self, policy: Dict) -> Tuple[bool, Optional[str]]:
+        """Валидация политики перед сохранением"""
+        if 'spec' not in policy:
+            return False, "Missing 'spec' field"
+        
+        spec = policy['spec']
+        
+        if 'endpointSelector' not in spec:
+            return False, "Missing endpointSelector"
+        
+        endpoint_selector = spec['endpointSelector']
+        if 'matchLabels' not in endpoint_selector and 'matchExpressions' not in endpoint_selector:
+            return False, "endpointSelector must have matchLabels or matchExpressions"
+        
+        # toEntities нельзя использовать с toPorts
+        for idx, rule in enumerate(spec.get('egress', [])):
+            if 'toEntities' in rule and 'toPorts' in rule:
+                return False, f"Egress rule #{idx}: toEntities cannot be used with toPorts"
+            
+            if 'toEndpoints' in rule:
+                for ep_idx, endpoint in enumerate(rule['toEndpoints']):
+                    if not isinstance(endpoint, dict):
+                        return False, f"Egress rule #{idx}, endpoint #{ep_idx}: must be dict"
+                    
+                    if 'matchLabels' not in endpoint and 'matchExpressions' not in endpoint:
+                        return False, f"Egress rule #{idx}, endpoint #{ep_idx}: need matchLabels or matchExpressions"
+                    
+                    if 'matchLabels' in endpoint:
+                        for key in endpoint['matchLabels'].keys():
+                            if key.startswith('k8s:'):
+                                return False, f"Egress rule #{idx}: invalid label key '{key}' with 'k8s:' prefix"
+            
+            if 'matchExpressions' in rule.get('toEndpoints', [{}])[0]:
+                for expr in rule['toEndpoints'][0]['matchExpressions']:
+                    if 'key' in expr and expr['key'].startswith('k8s:'):
+                        return False, f"Egress rule #{idx}: invalid expression key '{expr['key']}'"
+        
+        for idx, rule in enumerate(spec.get('ingress', [])):
+            if 'toEntities' in rule and 'toPorts' in rule:
+                return False, f"Ingress rule #{idx}: toEntities cannot be used with toPorts"
+            
+            if 'fromEndpoints' in rule:
+                for ep_idx, endpoint in enumerate(rule['fromEndpoints']):
+                    if not isinstance(endpoint, dict):
+                        return False, f"Ingress rule #{idx}, endpoint #{ep_idx}: must be dict"
+                    
+                    if 'matchLabels' not in endpoint and 'matchExpressions' not in endpoint:
+                        return False, f"Ingress rule #{idx}, endpoint #{ep_idx}: need matchLabels or matchExpressions"
+                    
+                    if 'matchLabels' in endpoint:
+                        for key in endpoint['matchLabels'].keys():
+                            if key.startswith('k8s:'):
+                                return False, f"Ingress rule #{idx}: invalid label key '{key}' with 'k8s:' prefix"
+            
+            if 'matchExpressions' in rule.get('fromEndpoints', [{}])[0]:
+                for expr in rule['fromEndpoints'][0]['matchExpressions']:
+                    if 'key' in expr and expr['key'].startswith('k8s:'):
+                        return False, f"Ingress rule #{idx}: invalid expression key '{expr['key']}'"
+        
+        return True, None
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Собрать flows из Hubble")
+    parser = argparse.ArgumentParser(description="Сбор flows из Hubble и генерация CiliumNetworkPolicy")
     parser.add_argument('-n', '--namespace', required=True, help='Namespace')
-    parser.add_argument('-o', '--output', required=True, help='Выходной файл')
-    parser.add_argument('--follow', action='store_true', help='Непрерывный мониторинг')
+    parser.add_argument('-o', '--output', required=True, help='Выходной JSON файл')
+    parser.add_argument('--follow', action='store_true', help='Режим follow')
     parser.add_argument('--duration', type=int, default=60, help='Секунд (default: 60)')
-    parser.add_argument('--from-label', dest='from_label', help='Фильтр по source label (например: app.kubernetes.io/name=api)')
+    parser.add_argument('--from-label', dest='from_label', help='Фильтр по source label')
     parser.add_argument('--to-label', dest='to_label', help='Фильтр по destination label')
     parser.add_argument('--verdict', choices=['FORWARDED', 'DROPPED', 'ERROR', 'AUDIT', 'REDIRECTED', 'TRACED'], 
-                       help='Фильтр по verdict (FORWARDED, DROPPED, etc)')
-    parser.add_argument('--debug-flows', dest='debug_flows', help='Сохранить сырые flows в файл для отладки')
+                       help='Фильтр по verdict')
+    parser.add_argument('--debug-flows', dest='debug_flows', help='Сохранить raw flows')
     parser.add_argument('--cilium', choices=['true', 'false'], default='false',
-                       help='Создать CiliumNetworkPolicy файлы (default: false)')
+                       help='Создать CiliumNetworkPolicy (default: false)')
     parser.add_argument('--cilium-output-dir', dest='cilium_output_dir', default='./cilium-policies',
-                       help='Директория для CiliumNetworkPolicy файлов (default: ./cilium-policies)')
+                       help='Директория для политик (default: ./cilium-policies)')
+    parser.add_argument('--pod-cidr', dest='pod_cidr',
+                       help='Pod CIDR (например: 10.244.0.0/16)')
+    parser.add_argument('--service-cidr', dest='service_cidr',
+                       help='Service CIDR (например: 10.96.0.0/12)')
     
     args = parser.parse_args()
     
@@ -591,10 +784,12 @@ def main():
         namespace=args.namespace,
         from_label=args.from_label,
         to_label=args.to_label,
-        verdict=args.verdict
+        verdict=args.verdict,
+        pod_cidr=args.pod_cidr,
+        service_cidr=args.service_cidr
     )
     
-    print(f"Сбор flows: {args.namespace}")
+    print(f"Сбор flows из: {args.namespace}")
     if args.from_label:
         print(f"   From Label: {args.from_label}")
     if args.to_label:
@@ -606,25 +801,23 @@ def main():
     collector.print_summary()
     collector.export_to_json(args.output)
     
-    # Создаём CiliumNetworkPolicy если указан флаг
     if args.cilium == 'true':
         print(f"\nГенерация CiliumNetworkPolicy...")
         try:
             policy_files = collector.export_cilium_policies(args.cilium_output_dir)
             print(f"\nСоздано {len(policy_files)} файлов политик в '{args.cilium_output_dir}'")
         except ImportError:
-            print("\nДля генерации CiliumNetworkPolicy требуется библиотека PyYAML")
-            print("   Установите: pip install pyyaml")
+            print("\nТребуется PyYAML для генерации политик")
+            print("   Установка: pip install pyyaml")
         except Exception as e:
             print(f"\nОшибка создания политик: {e}", file=sys.stderr)
     
-    # Сохраняем сырые flows для отладки
     if args.debug_flows:
         with open(args.debug_flows, 'w') as f:
             json.dump(collector.flows, f, indent=2)
         print(f"Debug flows: {args.debug_flows}")
     
-    print(f"\nFlows: {len(collector.flows)}")
+    print(f"\nВсего flows: {len(collector.flows)}")
 
 
 if __name__ == '__main__':

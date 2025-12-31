@@ -2,6 +2,14 @@
 
 Сбор сетевых взаимодействий между подами через Hubble и автоматическая генерация CiliumNetworkPolicy на основе реального трафика.
 
+**Возможности:**
+- Автоматическое создание egress и ingress правил
+- Интеграция с реальным Pod CIDR и Service CIDR
+- Поддержка внешних источников (LoadBalancer, Ingress Controller)
+- Фильтрация служебных Kubernetes/Cilium labels
+- Валидация политик перед сохранением
+- Мониторинг и аудит сетевого трафика
+
 ## Установка
 
 ### Требования
@@ -99,7 +107,145 @@ python3 hubble-collector.py -n dev01 -o flows.json \
 | `--verdict` | Фильтр по verdict (FORWARDED, DROPPED, ERROR, AUDIT, REDIRECTED, TRACED) | нет |
 | `--cilium` | Создать CiliumNetworkPolicy (true/false) | false |
 | `--cilium-output-dir` | Директория для политик | ./cilium-policies |
+| `--pod-cidr` | Pod CIDR кластера (критично для корректных политик) | 10.39.0.0/16 |
+| `--service-cidr` | Service CIDR кластера (критично для корректных политик) | 10.40.0.0/16 |
 | `--debug-flows` | Сохранить сырые flows для отладки | нет |
+
+## Критично важные параметры
+
+### Pod CIDR и Service CIDR
+
+Параметры `--pod-cidr` и `--service-cidr` критически важны для корректной генерации политик.
+
+#### Зачем нужны
+
+Скрипт должен различать:
+- Pod IP (внутренние IP подов)
+- Service IP (ClusterIP сервисов)
+- Внешние публичные IP
+
+Без указания CIDR скрипт использует стандартные частные сети (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), что может привести к неправильной классификации IP.
+
+#### Как узнать CIDR своего кластера
+
+```bash
+# Способ 1: Через kube-controller-manager
+kubectl -n kube-system get pod -l component=kube-controller-manager -o yaml | grep -E "cluster-cidr|service-cluster-ip-range"
+
+# Пример вывода:
+#   - --cluster-cidr=10.39.0.0/16
+#   - --service-cluster-ip-range=10.40.0.0/16
+
+# Способ 2: Через cluster-info
+kubectl cluster-info dump | grep -m 1 cluster-cidr
+kubectl cluster-info dump | grep -m 1 service-cluster-ip-range
+
+# Способ 3: Из configmap (если есть)
+kubectl -n kube-system get cm kubeadm-config -o yaml | grep -E "podSubnet|serviceSubnet"
+```
+
+#### Правильное использование
+
+```bash
+# С указанием CIDR (рекомендуется)
+python3 hubble-collector.py -n production -o flows.json \
+  --cilium true \
+  --pod-cidr "10.39.0.0/16" \
+  --service-cidr "10.40.0.0/16"
+```
+
+#### Что будет без указания CIDR
+
+Если не указать `--pod-cidr` и `--service-cidr`, скрипт использует дефолтные диапазоны:
+- 10.39.0.0/16 (Pod CIDR)
+- 10.40.0.0/16 (Service CIDR)
+- 172.16.0.0/12 (RFC1918)
+- 192.168.0.0/16 (RFC1918)
+- 100.64.0.0/10 (Shared address)
+
+Это подходит для большинства кластеров, но если ваши CIDR отличаются:
+1. IP могут быть неправильно классифицированы
+2. Создаются правила `toCIDR` вместо `toEndpoints`
+3. Политики становятся нестабильными (ломаются при рестарте подов)
+
+**Пример проблемы:**
+
+Без CIDR:
+```yaml
+egress:
+- toCIDR:
+  - 10.39.36.20/32  # IP пода - нестабильно!
+  toPorts:
+  - protocol: TCP
+    ports:
+    - port: '8080'
+```
+
+С правильным CIDR:
+```yaml
+egress:
+- toEndpoints:
+  - matchLabels:
+      app: backend-api  # Стабильно, не зависит от IP
+  toPorts:
+  - protocol: TCP
+    ports:
+    - port: '8080'
+```
+
+### Оптимальная продолжительность сбора
+
+Параметр `--duration` определяет как долго собирать flows.
+
+#### Рекомендации
+
+| Сценарий | Duration | Причина |
+|----------|----------|---------|
+| Тестирование скрипта | 60-300 сек | Быстрая проверка |
+| Production политики | 300-600 сек | Баланс покрытия и актуальности |
+| Полное покрытие | 1800-3600 сек | Все сценарии, но риск мёртвых подов |
+| Живые поды только | 300 сек | Минимум мёртвых IP |
+
+#### Проблема мёртвых подов
+
+Hubble хранит исторические flows. Если за время `--duration`:
+- Под был удалён
+- Под перезапустился и получил новый IP
+
+То скрипт увидит flows со старым IP, но пода с таким IP уже не будет.
+
+**Результат:** Скрипт выведет warning и пропустит такие flows:
+```
+Warning: unknown internal IP 10.39.36.20 (port 14816) - pod may have been deleted
+```
+
+#### Рекомендуемый подход
+
+Для production используйте короткий период с указанием CIDR:
+
+```bash
+python3 hubble-collector.py -n production -o flows.json \
+  --duration 300 \
+  --cilium true \
+  --pod-cidr "10.39.0.0/16" \
+  --service-cidr "10.40.0.0/16"
+```
+
+Если нужно больше покрытия - запускайте несколько раз в разное время и объединяйте политики вручную.
+
+#### Режим follow
+
+Для непрерывного мониторинга используйте `--follow`:
+
+```bash
+python3 hubble-collector.py -n production -o flows.json \
+  --follow \
+  --cilium true \
+  --pod-cidr "10.39.0.0/16" \
+  --service-cidr "10.40.0.0/16"
+
+# Остановите через Ctrl+C когда накопится достаточно flows
+```
 
 ## Примеры сценариев
 
@@ -108,7 +254,16 @@ python3 hubble-collector.py -n dev01 -o flows.json \
 ```bash
 # Шаг 1: Собрать flows за длительный период
 python3 hubble-collector.py -n production -o flows.json \
-  --duration 3600 --cilium true
+  --duration 3600 \
+  --cilium true \
+  --pod-cidr "10.39.0.0/16" \
+  --service-cidr "10.40.0.0/16"
+
+# Вывод:
+# Собрано flows: 15234
+# Создано connections: 542
+# Создана политика: ./cilium-policies/backend-api-cnp.yaml (egress: 5 rules, ingress: 3 rules)
+# Создана политика: ./cilium-policies/frontend-cnp.yaml (egress: 8 rules, ingress: 2 rules)
 
 # Шаг 2: Проверить созданные политики
 ls -la ./cilium-policies/
@@ -138,13 +293,19 @@ python3 hubble-collector.py -n prod -o api-blocked.json \
 ### 3. Мониторинг конкретного приложения
 
 ```bash
-# Исходящие connections
+# Исходящие connections (egress)
 python3 hubble-collector.py -n prod -o api-outbound.json \
   --from-label "app=backend-api" --follow
 
-# Входящие connections к базе
+# Входящие connections (ingress)
 python3 hubble-collector.py -n prod -o db-clients.json \
   --to-label "app=postgres" --follow
+
+# Полная картина (egress + ingress) для сервиса
+python3 hubble-collector.py -n prod -o service-flows.json \
+  --from-label "app=api" \
+  --cilium true \
+  --duration 600
 ```
 
 ### 4. Миграция на CiliumNetworkPolicy
@@ -215,26 +376,17 @@ metadata:
 spec:
   endpointSelector:
     matchLabels:
-      k8s:app: backend-api
+      app: backend-api
+  
   egress:
-  # Pod-to-Pod (по labels)
   - toEndpoints:
     - matchLabels:
-        k8s:app: postgres
+        app: postgres
     toPorts:
     - protocol: TCP
       ports:
       - port: "5432"
   
-  # Внутрикластерный IP без информации о поде
-  - toEntities:
-    - cluster
-    toPorts:
-    - protocol: TCP
-      ports:
-      - port: "8080"
-  
-  # Внешний публичный IP
   - toCIDR:
     - "8.8.8.8/32"
     toPorts:
@@ -242,40 +394,188 @@ spec:
       ports:
       - port: "53"
   
-  # DNS (добавляется автоматически)
   - toEndpoints:
     - matchLabels:
-        k8s:io.kubernetes.pod.namespace: kube-system
-        k8s:k8s-app: kube-dns
+        io.kubernetes.pod.namespace: kube-system
+        k8s-app: kube-dns
     toPorts:
     - protocol: UDP
       ports:
       - port: "53"
+  
+  ingress:
+  - fromEndpoints:
+    - matchLabels:
+        app: frontend
+    toPorts:
+    - protocol: TCP
+      ports:
+      - port: "8080"
+  
+  - fromCIDR:
+    - "203.0.113.5/32"
+    toPorts:
+    - protocol: TCP
+      ports:
+      - port: "8080"
 ```
 
 ## Как работает генерация политик
 
+Скрипт анализирует flows и автоматически генерирует **egress и ingress правила** на основе реального трафика.
+
+### Egress и Ingress
+
+Для каждого пода создаётся комплексная политика:
+
+**Egress (исходящий трафик):**
+- Контролирует куда под может подключаться
+- Правила `toEndpoints` для pod-to-pod
+- Правила `toCIDR` для внешних IP
+- Автоматически добавляется DNS
+
+**Ingress (входящий трафик):**
+- Контролирует кто может подключаться к поду
+- Правила `fromEndpoints` для pod-to-pod
+- Правила `fromCIDR` для внешних источников (loadbalancer, ingress-controller)
+- Учитывает реальные порты и протоколы
+
+**Пример генерируемой политики:**
+
+```yaml
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: backend-api
+spec:
+  endpointSelector:
+    matchLabels:
+      app: backend-api
+  
+  egress:
+  - toEndpoints:
+    - matchLabels:
+        app: postgres
+    toPorts:
+    - protocol: TCP
+      ports:
+      - port: "5432"
+  
+  - toCIDR:
+    - "8.8.8.8/32"
+    toPorts:
+    - protocol: UDP
+      ports:
+      - port: "53"
+  
+  ingress:
+  - fromEndpoints:
+    - matchLabels:
+        app: frontend
+    toPorts:
+    - protocol: TCP
+      ports:
+      - port: "8080"
+  
+  - fromCIDR:
+    - "203.0.113.5/32"
+    toPorts:
+    - protocol: TCP
+      ports:
+      - port: "8080"
+```
+
+### Логика определения типа назначения
+
 Скрипт умно определяет тип назначения и использует правильные селекторы:
 
-| Тип соединения | IP адрес | Используемый селектор | Причина |
-|----------------|----------|----------------------|---------|
-| Pod в том же NS | 10.244.1.20 | toEndpoints + matchLabels | Известны labels пода |
-| Pod в другом NS | 10.244.2.30 | toEndpoints + matchExpressions (NS) | Известен namespace |
-| Pod по IP | 10.244.3.40 | toEndpoints + matchLabels | IP найден в маппинге |
-| Service IP | 10.96.0.10 | toEntities: ['cluster'] | Внутренний IP без pod info |
-| Внешний API | 8.8.8.8 | toCIDR | Публичный IP |
+| Тип соединения | IP адрес | Egress селектор | Ingress селектор |
+|----------------|----------|----------------|------------------|
+| Pod в том же NS | 10.39.1.20 | toEndpoints + matchLabels | fromEndpoints + matchLabels |
+| Pod в другом NS | 10.39.2.30 | toEndpoints + matchExpressions | fromEndpoints + matchExpressions |
+| Pod по IP | 10.39.3.40 | toEndpoints + matchLabels | fromEndpoints + matchLabels |
+| Внешний API/LB | 8.8.8.8 | toCIDR | fromCIDR |
+| Мёртвый под | 10.39.36.20 | пропускается | пропускается |
 
 ### Определение внешних IP
 
-Скрипт считает IP внешним (используя toCIDR), если он НЕ в диапазонах:
-- 10.0.0.0/8 (частная сеть)
-- 172.16.0.0/12 (частная сеть)
-- 192.168.0.0/16 (частная сеть)
-- 127.0.0.0/8 (loopback)
-- 169.254.0.0/16 (link-local)
-- 100.64.0.0/10 (service CIDR)
+С параметрами `--pod-cidr` и `--service-cidr`:
+- Проверяется реальный CIDR кластера
+- Точная классификация Pod vs External IP
 
-Всё остальное = внешний публичный IP → используется toCIDR
+Без параметров (дефолт для типичных кластеров):
+- 10.39.0.0/16 (Pod CIDR)
+- 10.40.0.0/16 (Service CIDR)
+- 172.16.0.0/12 (RFC1918)
+- 192.168.0.0/16 (RFC1918)
+- 100.64.0.0/10 (Shared address space)
+
+**Важно:** Если ваш кластер использует другие диапазоны, обязательно укажите `--pod-cidr` и `--service-cidr`.
+
+### Генерация Ingress правил
+
+Скрипт автоматически создаёт ingress правила на основе flows:
+
+**Внешние источники (LoadBalancer, Ingress Controller):**
+```yaml
+ingress:
+- fromCIDR:
+  - "203.0.113.5/32"
+  toPorts:
+  - protocol: TCP
+    ports:
+    - port: "8080"
+```
+
+**Внутренние источники (pod-to-pod):**
+```yaml
+ingress:
+- fromEndpoints:
+  - matchLabels:
+      app: frontend
+  toPorts:
+  - protocol: TCP
+    ports:
+    - port: "8080"
+```
+
+**Преимущества:**
+- Полная изоляция (контроль входящего и исходящего трафика)
+- Защита от несанкционированных подключений
+- Явное разрешение для LoadBalancer и Ingress Controller
+- Автоматическая синхронизация egress и ingress (из одних flows)
+
+### Дефолтные порты для инфраструктуры
+
+Если Hubble не может определить порт (например, соединение прервалось до установки), скрипт автоматически подставляет известные порты для популярных компонентов:
+
+| Компонент | Порт | Протокол |
+|-----------|------|----------|
+| RabbitMQ | 5672 | TCP |
+| RabbitMQ Management | 15672 | TCP |
+| Redis | 6379 | TCP |
+| Redis Sentinel | 26379 | TCP |
+| PostgreSQL | 5432 | TCP |
+| VictoriaMetrics (vmagent) | 8429 | TCP |
+| VictoriaMetrics (vmsingle) | 8429 | TCP |
+| VictoriaMetrics (vmselect) | 8481 | TCP |
+| VictoriaMetrics (vminsert) | 8480 | TCP |
+| VictoriaMetrics (vmstorage) | 8482 | TCP |
+| Prometheus | 9090 | TCP |
+| Alertmanager | 9093 | TCP |
+| Grafana | 3000 | TCP |
+| DNS (kube-dns, coredns) | 53 | UDP |
+
+**Определение по labels:**
+Скрипт анализирует `app`, `app.kubernetes.io/name`, `app.kubernetes.io/component`, `k8s-app` для подстановки дефолтного порта.
+
+**Пример:**
+```
+Using default port 6379/TCP for pod:dev01/redis-sentinel-0
+Using default port 8429/TCP for ingress from pod:monitoring/vmagent-0
+```
+
+**Важно:** Дефолтные порты используются только если Hubble не смог определить реальный порт. Если порт известен - используется реальный порт из flows.
 
 ### Фильтрация labels
 
@@ -426,8 +726,35 @@ python3 hubble-collector.py -n production -o flows.json \
 
 1. Применить в test namespace
 2. Мониторить dropped flows
-3. Проверить работоспособность
-4. Только потом применять в production
+3. Проверить работоспособность всех сервисов
+4. Проверить работу ingress (LoadBalancer, Ingress Controller)
+5. Только потом применять в production
+
+### Ingress правила
+
+При использовании LoadBalancer или Ingress Controller:
+
+**Проверьте что внешние IP разрешены:**
+```bash
+# Найти IP LoadBalancer
+kubectl get svc -n ingress-nginx
+
+# Проверить что этот IP есть в fromCIDR правилах
+grep -r "203.0.113" ./cilium-policies/
+```
+
+**Если ingress блокируется:**
+```bash
+# Найти источник трафика
+python3 hubble-collector.py -n production -o ingress-flows.json \
+  --to-label "app=backend-api" \
+  --duration 300
+
+# Проверить dropped flows
+python3 hubble-collector.py -n production -o dropped.json \
+  --verdict DROPPED \
+  --to-label "app=backend-api"
+```
 
 ### Мониторинг после применения
 
