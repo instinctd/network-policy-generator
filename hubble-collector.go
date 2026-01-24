@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -37,6 +38,25 @@ var DefaultPorts = map[string]PortConfig{
 	"coredns":             {Port: "53", Protocol: "UDP"},
 }
 
+// Compiled regex patterns (cached for performance)
+var (
+	regexPodHash1      = regexp.MustCompile(`-[a-f0-9]{8,10}-[a-z0-9]{5}$`)
+	regexPodHash2      = regexp.MustCompile(`-[a-f0-9]{9,10}$`)
+	regexInvalidChars  = regexp.MustCompile(`[^a-z0-9-]`)
+	regexDuplicateDash = regexp.MustCompile(`-+`)
+	regexStatefulSet   = regexp.MustCompile(`-\d+$`)
+)
+
+// Exclude prefixes for label filtering (shared constant)
+var excludePrefixes = []string{
+	"io.cilium.",
+	"io.kubernetes.pod.",
+	"pod-template-hash",
+	"controller-revision-hash",
+	"statefulset.kubernetes.io/pod-name",
+	"commit",
+}
+
 type PortConfig struct {
 	Port     string
 	Protocol string
@@ -56,6 +76,7 @@ type HubbleCollector struct {
 	IPToService      map[string]ServiceInfo
 	UnresolvedIPs    map[string]bool
 	InternalNetworks []*net.IPNet
+	mu               sync.RWMutex // Protects concurrent access to maps
 }
 
 type PodInfo struct {
@@ -447,10 +468,15 @@ func (hc *HubbleCollector) processFlow(flow map[string]interface{}) {
 	if sourcePodName != "" && sourceNS != "" {
 		sourceLabels := getStringSlice(source, "labels")
 		if len(sourceLabels) > 0 {
-			hc.PodLabels[sourcePodName] = hc.parseLabels(sourceLabels)
+			parsedLabels := hc.parseLabels(sourceLabels)
+			hc.mu.Lock()
+			hc.PodLabels[sourcePodName] = parsedLabels
+			hc.mu.Unlock()
 		}
 		if sourceIP != "unknown" {
+			hc.mu.Lock()
 			hc.IPToPod[sourceIP] = PodInfo{Name: sourcePodName, Namespace: sourceNS}
+			hc.mu.Unlock()
 		}
 	}
 
@@ -459,10 +485,15 @@ func (hc *HubbleCollector) processFlow(flow map[string]interface{}) {
 	if destPodName != "" && destNS != "" {
 		destLabels := getStringSlice(destination, "labels")
 		if len(destLabels) > 0 {
-			hc.PodLabels[destPodName] = hc.parseLabels(destLabels)
+			parsedLabels := hc.parseLabels(destLabels)
+			hc.mu.Lock()
+			hc.PodLabels[destPodName] = parsedLabels
+			hc.mu.Unlock()
 		}
 		if destIP != "unknown" {
+			hc.mu.Lock()
 			hc.IPToPod[destIP] = PodInfo{Name: destPodName, Namespace: destNS}
+			hc.mu.Unlock()
 		}
 	}
 
@@ -492,6 +523,7 @@ func (hc *HubbleCollector) processFlow(flow map[string]interface{}) {
 	}
 
 	if sourcePod != "" && destPod != "" && sourcePod != destPod {
+		hc.mu.Lock()
 		if hc.Connections[sourcePod] == nil {
 			hc.Connections[sourcePod] = make(map[string]int)
 		}
@@ -515,6 +547,7 @@ func (hc *HubbleCollector) processFlow(flow map[string]interface{}) {
 			hc.FlowDetails[sourcePod] = make(map[string][]FlowDetail)
 		}
 		hc.FlowDetails[sourcePod][destPod] = append(hc.FlowDetails[sourcePod][destPod], flowDetail)
+		hc.mu.Unlock()
 	}
 }
 
@@ -614,14 +647,6 @@ func (hc *HubbleCollector) buildDestPodName(destination map[string]interface{}, 
 
 func (hc *HubbleCollector) parseLabels(labelsList []string) map[string]string {
 	labels := make(map[string]string)
-	excludePrefixes := []string{
-		"io.cilium.",
-		"io.kubernetes.pod.",
-		"pod-template-hash",
-		"controller-revision-hash",
-		"statefulset.kubernetes.io/pod-name",
-		"commit",
-	}
 
 	for _, label := range labelsList {
 		if !strings.Contains(label, "=") || strings.HasPrefix(label, "reserved:") {
@@ -671,15 +696,6 @@ func (hc *HubbleCollector) parseLabels(labelsList []string) map[string]string {
 }
 
 func (hc *HubbleCollector) filterK8sLabels(labelsDict map[string]interface{}) map[string]string {
-	excludePrefixes := []string{
-		"io.cilium.",
-		"io.kubernetes.pod.",
-		"pod-template-hash",
-		"controller-revision-hash",
-		"statefulset.kubernetes.io/pod-name",
-		"commit",
-	}
-
 	filtered := make(map[string]string)
 	for key, value := range labelsDict {
 		shouldExclude := false
@@ -719,6 +735,8 @@ func (hc *HubbleCollector) filterK8sLabels(labelsDict map[string]interface{}) ma
 }
 
 func (hc *HubbleCollector) resolveIPToPod(ip string) *PodInfo {
+	// This function should only read from maps, no writes
+	// Note: caller must hold at least RLock
 	if podInfo, ok := hc.IPToPod[ip]; ok {
 		return &podInfo
 	}
@@ -728,48 +746,11 @@ func (hc *HubbleCollector) resolveIPToPod(ip string) *PodInfo {
 	}
 
 	if _, ok := hc.IPToService[ip]; ok {
-		hc.UnresolvedIPs[ip] = true
 		return nil
 	}
 
-	cmd := exec.Command("kubectl", "get", "pods", "--all-namespaces", "-o", "json", "--field-selector", fmt.Sprintf("status.podIP=%s", ip))
-	output, err := cmd.Output()
-	if err != nil {
-		hc.UnresolvedIPs[ip] = true
-		return nil
-	}
-
-	var result map[string]interface{}
-	if err := json.Unmarshal(output, &result); err != nil {
-		hc.UnresolvedIPs[ip] = true
-		return nil
-	}
-
-	items, ok := result["items"].([]interface{})
-	if !ok || len(items) == 0 {
-		hc.UnresolvedIPs[ip] = true
-		return nil
-	}
-
-	pod, _ := items[0].(map[string]interface{})
-	metadata, _ := pod["metadata"].(map[string]interface{})
-	labelsDict, _ := metadata["labels"].(map[string]interface{})
-
-	podName := getString(metadata, "name", "")
-	podNS := getString(metadata, "namespace", "")
-
-	podInfo := PodInfo{Name: podName, Namespace: podNS}
-	hc.IPToPod[ip] = podInfo
-	hc.IPToNamespace[ip] = podNS
-
-	if podNS == hc.Namespace && labelsDict != nil {
-		filteredLabels := hc.filterK8sLabels(labelsDict)
-		if len(filteredLabels) > 0 {
-			hc.PodLabels[podName] = filteredLabels
-		}
-	}
-
-	return &podInfo
+	// IP not in cache, not a service, and not previously marked unresolved
+	return nil
 }
 
 func (hc *HubbleCollector) isExternalIP(ip string) bool {
@@ -969,7 +950,10 @@ func (hc *HubbleCollector) ExportCiliumPolicies(outputDir string) ([]string, err
 	}
 
 	policiesByPod := make(map[string]*PolicyData)
+	unresolvedIPs := make(map[string]bool) // Track IPs we couldn't resolve
 
+	// Lock for reading FlowDetails
+	hc.mu.RLock()
 	for _, destinations := range hc.FlowDetails {
 		for _, flowList := range destinations {
 			for _, flow := range flowList {
@@ -1025,6 +1009,7 @@ func (hc *HubbleCollector) ExportCiliumPolicies(outputDir string) ([]string, err
 								if isInternal {
 									// Skip internal IPs that cannot be resolved to avoid incorrect toCIDR rules
 									fmt.Printf("  Warning: skipping internal IP %s:%v - cannot resolve to pod/namespace\n", destIP, destPort)
+									unresolvedIPs[destIP] = true // Track for later
 									continue
 								} else {
 									destKey = fmt.Sprintf("external:%s", destIP)
@@ -1093,6 +1078,7 @@ func (hc *HubbleCollector) ExportCiliumPolicies(outputDir string) ([]string, err
 								if isInternal {
 									// Skip internal IPs that cannot be resolved to avoid incorrect fromCIDR rules
 									fmt.Printf("  Warning: skipping internal source IP %s - cannot resolve to pod/namespace\n", sourceIP)
+									unresolvedIPs[sourceIP] = true // Track for later
 									continue
 								} else {
 									sourceKey = fmt.Sprintf("external:%s", sourceIP)
@@ -1120,296 +1106,346 @@ func (hc *HubbleCollector) ExportCiliumPolicies(outputDir string) ([]string, err
 			}
 		}
 	}
+	hc.mu.RUnlock()
+
+	// Mark unresolved IPs after releasing the read lock
+	if len(unresolvedIPs) > 0 {
+		hc.mu.Lock()
+		for ip := range unresolvedIPs {
+			hc.UnresolvedIPs[ip] = true
+		}
+		hc.mu.Unlock()
+	}
 
 	policyFiles := []string{}
+	var policyFilesMu sync.Mutex
 
-	for podName, policyData := range policiesByPod {
-		podLabels, ok := hc.PodLabels[podName]
-		if !ok || len(podLabels) == 0 {
-			podLabels = hc.extractLabelsFromPodName(podName)
-		}
-
-		if len(podLabels) == 0 {
-			fmt.Printf("Skip pod '%s' - нет labels\n", podName)
-			continue
-		}
-
-		// Filter out invalid labels
-		validLabels := make(map[string]string)
-		for k, v := range podLabels {
-			if !strings.HasPrefix(k, "k8s:") && !strings.HasPrefix(k, "io.cilium") && !strings.HasPrefix(k, "io.kubernetes.pod") {
-				validLabels[k] = v
-			}
-		}
-
-		if len(validLabels) == 0 {
-			fmt.Printf("Skip pod '%s' - все labels служебные\n", podName)
-			continue
-		}
-
-		policy := CiliumNetworkPolicy{
-			APIVersion: "cilium.io/v2",
-			Kind:       "CiliumNetworkPolicy",
-			Metadata: Metadata{
-				Name:      hc.sanitizeName(podName),
-				Namespace: hc.Namespace,
-			},
-			Spec: PolicySpec{
-				EndpointSelector: EndpointSelector{
-					MatchLabels: validLabels,
-				},
-				Egress:  []EgressRule{},
-				Ingress: []IngressRule{},
-			},
-		}
-
-		// Build egress rules
-		for destKey, destInfo := range policyData.Egress {
-			parts := strings.SplitN(destKey, ":", 2)
-			if len(parts) != 2 {
-				continue
-			}
-
-			destType := parts[0]
-			destValue := parts[1]
-
-			egressRule := EgressRule{}
-			var destPodLabels map[string]string
-
-			switch destType {
-			case "pod":
-				nsParts := strings.SplitN(destValue, "/", 2)
-				if len(nsParts) == 2 {
-					destNS := nsParts[0]
-					destPod := nsParts[1]
-					destPodLabels = hc.PodLabels[destPod]
-
-					if len(destPodLabels) > 0 {
-						egressRule.ToEndpoints = []EndpointSelector{{MatchLabels: destPodLabels}}
-					} else {
-						egressRule.ToEndpoints = []EndpointSelector{{
-							MatchExpressions: []MatchExpression{{
-								Key:      "io.kubernetes.pod.namespace",
-								Operator: "In",
-								Values:   []string{destNS},
-							}},
-						}}
-					}
-				}
-			case "ns":
-				egressRule.ToEndpoints = []EndpointSelector{{
-					MatchExpressions: []MatchExpression{{
-						Key:      "io.kubernetes.pod.namespace",
-						Operator: "In",
-						Values:   []string{destValue},
-					}},
-				}}
-			case "external":
-				egressRule.ToCIDR = []string{fmt.Sprintf("%s/32", destValue)}
-			default:
-				continue
-			}
-
-			// Add default ports if missing
-			if len(destInfo.Ports) == 0 || len(destInfo.Protocols) == 0 {
-				defaultPort := hc.getDefaultPort(destPodLabels)
-				if defaultPort != nil {
-					destInfo.Ports[defaultPort.Port] = true
-					destInfo.Protocols[defaultPort.Protocol] = true
-					fmt.Printf("  Using default port %s/%s for %s\n", defaultPort.Port, defaultPort.Protocol, destKey)
-				}
-			}
-
-			if len(destInfo.Ports) > 0 && len(destInfo.Protocols) > 0 {
-				egressRule.ToPorts = []PortRule{}
-				for protocol := range destInfo.Protocols {
-					portRule := PortRule{
-						Protocol: strings.ToUpper(protocol),
-						Ports:    []PortSpec{},
-					}
-					ports := []string{}
-					for port := range destInfo.Ports {
-						ports = append(ports, port)
-					}
-					sort.Strings(ports)
-					for _, port := range ports {
-						portRule.Ports = append(portRule.Ports, PortSpec{Port: port})
-					}
-					egressRule.ToPorts = append(egressRule.ToPorts, portRule)
-				}
-			}
-
-			if len(egressRule.ToEndpoints) > 0 || len(egressRule.ToCIDR) > 0 {
-				if len(destInfo.Ports) > 0 || len(egressRule.ToCIDR) > 0 {
-					policy.Spec.Egress = append(policy.Spec.Egress, egressRule)
-				}
-			}
-		}
-
-		// Build ingress rules
-		for sourceKey, sourceInfo := range policyData.Ingress {
-			parts := strings.SplitN(sourceKey, ":", 2)
-			if len(parts) != 2 {
-				continue
-			}
-
-			sourceType := parts[0]
-			sourceValue := parts[1]
-
-			ingressRule := IngressRule{}
-			var sourcePodLabels map[string]string
-
-			switch sourceType {
-			case "pod":
-				nsParts := strings.SplitN(sourceValue, "/", 2)
-				if len(nsParts) == 2 {
-					sourceNS := nsParts[0]
-					sourcePod := nsParts[1]
-					sourcePodLabels = hc.PodLabels[sourcePod]
-
-					if len(sourcePodLabels) > 0 {
-						ingressRule.FromEndpoints = []EndpointSelector{{MatchLabels: sourcePodLabels}}
-					} else {
-						ingressRule.FromEndpoints = []EndpointSelector{{
-							MatchExpressions: []MatchExpression{{
-								Key:      "io.kubernetes.pod.namespace",
-								Operator: "In",
-								Values:   []string{sourceNS},
-							}},
-						}}
-					}
-				}
-			case "ns":
-				ingressRule.FromEndpoints = []EndpointSelector{{
-					MatchExpressions: []MatchExpression{{
-						Key:      "io.kubernetes.pod.namespace",
-						Operator: "In",
-						Values:   []string{sourceValue},
-					}},
-				}}
-			case "external":
-				ingressRule.FromCIDR = []string{fmt.Sprintf("%s/32", sourceValue)}
-			default:
-				continue
-			}
-
-			// Add default ports if missing
-			if len(sourceInfo.Ports) == 0 || len(sourceInfo.Protocols) == 0 {
-				defaultPort := hc.getDefaultPort(sourcePodLabels)
-				if defaultPort != nil {
-					sourceInfo.Ports[defaultPort.Port] = true
-					sourceInfo.Protocols[defaultPort.Protocol] = true
-					fmt.Printf("  Using default port %s/%s for ingress from %s\n", defaultPort.Port, defaultPort.Protocol, sourceKey)
-				}
-			}
-
-			if len(sourceInfo.Ports) > 0 && len(sourceInfo.Protocols) > 0 {
-				ingressRule.ToPorts = []PortRule{}
-				for protocol := range sourceInfo.Protocols {
-					portRule := PortRule{
-						Protocol: strings.ToUpper(protocol),
-						Ports:    []PortSpec{},
-					}
-					ports := []string{}
-					for port := range sourceInfo.Ports {
-						ports = append(ports, port)
-					}
-					sort.Strings(ports)
-					for _, port := range ports {
-						portRule.Ports = append(portRule.Ports, PortSpec{Port: port})
-					}
-					ingressRule.ToPorts = append(ingressRule.ToPorts, portRule)
-				}
-			}
-
-			if len(ingressRule.FromEndpoints) > 0 || len(ingressRule.FromCIDR) > 0 {
-				if len(sourceInfo.Ports) > 0 || len(ingressRule.FromCIDR) > 0 {
-					policy.Spec.Ingress = append(policy.Spec.Ingress, ingressRule)
-				}
-			}
-		}
-
-		// Add DNS rule if not present
-		hasDNSRule := false
-		for _, rule := range policy.Spec.Egress {
-			for _, endpoint := range rule.ToEndpoints {
-				if endpoint.MatchLabels != nil {
-					if app, ok := endpoint.MatchLabels["k8s-app"]; ok && (app == "kube-dns" || app == "coredns") {
-						hasDNSRule = true
-						break
-					}
-				}
-			}
-			if hasDNSRule {
-				break
-			}
-		}
-
-		if !hasDNSRule {
-			dnsRule := EgressRule{
-				ToEndpoints: []EndpointSelector{{
-					MatchLabels: map[string]string{
-						"io.kubernetes.pod.namespace": "kube-system",
-						"k8s-app":                     "kube-dns",
-					},
-				}},
-				ToPorts: []PortRule{{
-					Protocol: "UDP",
-					Ports:    []PortSpec{{Port: "53"}},
-				}},
-			}
-			policy.Spec.Egress = append(policy.Spec.Egress, dnsRule)
-		}
-
-		// Validate policy
-		if valid, err := hc.validatePolicy(&policy); !valid {
-			fmt.Printf("ОШИБКА валидации политики '%s': %s\n", podName, err)
-			fmt.Println("Политика пропущена. Проверь flows для этого пода.")
-			continue
-		}
-
-		filename := fmt.Sprintf("%s-cnp.yaml", hc.sanitizeName(podName))
-		filepath := fmt.Sprintf("%s/%s", outputDir, filename)
-
-		file, err := os.Create(filepath)
-		if err != nil {
-			return policyFiles, err
-		}
-
-		encoder := yaml.NewEncoder(file)
-		encoder.SetIndent(2)
-		if err := encoder.Encode(&policy); err != nil {
-			file.Close()
-			return policyFiles, err
-		}
-		file.Close()
-
-		policyFiles = append(policyFiles, filepath)
-
-		egressCount := len(policy.Spec.Egress)
-		ingressCount := len(policy.Spec.Ingress)
-		fmt.Printf("Создана политика: %s (egress: %d rules, ingress: %d rules)\n", filepath, egressCount, ingressCount)
+	// Use worker pool for parallel policy generation
+	type policyJob struct {
+		podName    string
+		policyData *PolicyData
 	}
+
+	jobs := make(chan policyJob, len(policiesByPod))
+	var wg sync.WaitGroup
+	numWorkers := 10 // Parallel workers
+
+	// Worker function
+	worker := func() {
+		defer wg.Done()
+		for job := range jobs {
+			hc.processPolicyJob(job.podName, job.policyData, outputDir, &policyFiles, &policyFilesMu)
+		}
+	}
+
+	// Start workers
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go worker()
+	}
+
+	// Send jobs
+	for podName, policyData := range policiesByPod {
+		jobs <- policyJob{podName: podName, policyData: policyData}
+	}
+	close(jobs)
+
+	// Wait for completion
+	wg.Wait()
 
 	return policyFiles, nil
 }
 
-func (hc *HubbleCollector) sanitizeName(name string) string {
-	// Remove pod hash suffixes
-	re1 := regexp.MustCompile(`-[a-f0-9]{8,10}-[a-z0-9]{5}$`)
-	name = re1.ReplaceAllString(name, "")
+func (hc *HubbleCollector) processPolicyJob(podName string, policyData *PolicyData, outputDir string, policyFiles *[]string, mu *sync.Mutex) {
+	hc.mu.RLock()
+	podLabels, ok := hc.PodLabels[podName]
+	if !ok || len(podLabels) == 0 {
+		podLabels = hc.extractLabelsFromPodName(podName)
+	}
+	hc.mu.RUnlock()
 
-	re2 := regexp.MustCompile(`-[a-f0-9]{9,10}$`)
-	name = re2.ReplaceAllString(name, "")
+	if len(podLabels) == 0 {
+		fmt.Printf("Skip pod '%s' - нет labels\n", podName)
+		return
+	}
+
+	// Filter out invalid labels
+	validLabels := make(map[string]string)
+	for k, v := range podLabels {
+		if !strings.HasPrefix(k, "k8s:") && !strings.HasPrefix(k, "io.cilium") && !strings.HasPrefix(k, "io.kubernetes.pod") {
+			validLabels[k] = v
+		}
+	}
+
+	if len(validLabels) == 0 {
+		fmt.Printf("Skip pod '%s' - все labels служебные\n", podName)
+		return
+	}
+
+	policy := CiliumNetworkPolicy{
+		APIVersion: "cilium.io/v2",
+		Kind:       "CiliumNetworkPolicy",
+		Metadata: Metadata{
+			Name:      hc.sanitizeName(podName),
+			Namespace: hc.Namespace,
+		},
+		Spec: PolicySpec{
+			EndpointSelector: EndpointSelector{
+				MatchLabels: validLabels,
+			},
+			Egress:  []EgressRule{},
+			Ingress: []IngressRule{},
+		},
+	}
+
+	// Build egress rules
+	for destKey, destInfo := range policyData.Egress {
+		parts := strings.SplitN(destKey, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		destType := parts[0]
+		destValue := parts[1]
+
+		egressRule := EgressRule{}
+		var destPodLabels map[string]string
+
+		switch destType {
+		case "pod":
+			nsParts := strings.SplitN(destValue, "/", 2)
+			if len(nsParts) == 2 {
+				destNS := nsParts[0]
+				destPod := nsParts[1]
+				hc.mu.RLock()
+				destPodLabels = hc.PodLabels[destPod]
+				hc.mu.RUnlock()
+
+				if len(destPodLabels) > 0 {
+					egressRule.ToEndpoints = []EndpointSelector{{MatchLabels: destPodLabels}}
+				} else {
+					egressRule.ToEndpoints = []EndpointSelector{{
+						MatchExpressions: []MatchExpression{{
+							Key:      "io.kubernetes.pod.namespace",
+							Operator: "In",
+							Values:   []string{destNS},
+						}},
+					}}
+				}
+			}
+		case "ns":
+			egressRule.ToEndpoints = []EndpointSelector{{
+				MatchExpressions: []MatchExpression{{
+					Key:      "io.kubernetes.pod.namespace",
+					Operator: "In",
+					Values:   []string{destValue},
+				}},
+			}}
+		case "external":
+			egressRule.ToCIDR = []string{fmt.Sprintf("%s/32", destValue)}
+		default:
+			continue
+		}
+
+		// Add default ports if missing
+		if len(destInfo.Ports) == 0 || len(destInfo.Protocols) == 0 {
+			defaultPort := hc.getDefaultPort(destPodLabels)
+			if defaultPort != nil {
+				destInfo.Ports[defaultPort.Port] = true
+				destInfo.Protocols[defaultPort.Protocol] = true
+				fmt.Printf("  Using default port %s/%s for %s\n", defaultPort.Port, defaultPort.Protocol, destKey)
+			}
+		}
+
+		if len(destInfo.Ports) > 0 && len(destInfo.Protocols) > 0 {
+			egressRule.ToPorts = []PortRule{}
+			for protocol := range destInfo.Protocols {
+				portRule := PortRule{
+					Protocol: strings.ToUpper(protocol),
+					Ports:    []PortSpec{},
+				}
+				ports := []string{}
+				for port := range destInfo.Ports {
+					ports = append(ports, port)
+				}
+				sort.Strings(ports)
+				for _, port := range ports {
+					portRule.Ports = append(portRule.Ports, PortSpec{Port: port})
+				}
+				egressRule.ToPorts = append(egressRule.ToPorts, portRule)
+			}
+		}
+
+		if len(egressRule.ToEndpoints) > 0 || len(egressRule.ToCIDR) > 0 {
+			if len(destInfo.Ports) > 0 || len(egressRule.ToCIDR) > 0 {
+				policy.Spec.Egress = append(policy.Spec.Egress, egressRule)
+			}
+		}
+	}
+
+	// Build ingress rules
+	for sourceKey, sourceInfo := range policyData.Ingress {
+		parts := strings.SplitN(sourceKey, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		sourceType := parts[0]
+		sourceValue := parts[1]
+
+		ingressRule := IngressRule{}
+		var sourcePodLabels map[string]string
+
+		switch sourceType {
+		case "pod":
+			nsParts := strings.SplitN(sourceValue, "/", 2)
+			if len(nsParts) == 2 {
+				sourceNS := nsParts[0]
+				sourcePod := nsParts[1]
+				hc.mu.RLock()
+				sourcePodLabels = hc.PodLabels[sourcePod]
+				hc.mu.RUnlock()
+
+				if len(sourcePodLabels) > 0 {
+					ingressRule.FromEndpoints = []EndpointSelector{{MatchLabels: sourcePodLabels}}
+				} else {
+					ingressRule.FromEndpoints = []EndpointSelector{{
+						MatchExpressions: []MatchExpression{{
+							Key:      "io.kubernetes.pod.namespace",
+							Operator: "In",
+							Values:   []string{sourceNS},
+						}},
+					}}
+				}
+			}
+		case "ns":
+			ingressRule.FromEndpoints = []EndpointSelector{{
+				MatchExpressions: []MatchExpression{{
+					Key:      "io.kubernetes.pod.namespace",
+					Operator: "In",
+					Values:   []string{sourceValue},
+				}},
+			}}
+		case "external":
+			ingressRule.FromCIDR = []string{fmt.Sprintf("%s/32", sourceValue)}
+		default:
+			continue
+		}
+
+		// Add default ports if missing
+		if len(sourceInfo.Ports) == 0 || len(sourceInfo.Protocols) == 0 {
+			defaultPort := hc.getDefaultPort(sourcePodLabels)
+			if defaultPort != nil {
+				sourceInfo.Ports[defaultPort.Port] = true
+				sourceInfo.Protocols[defaultPort.Protocol] = true
+				fmt.Printf("  Using default port %s/%s for ingress from %s\n", defaultPort.Port, defaultPort.Protocol, sourceKey)
+			}
+		}
+
+		if len(sourceInfo.Ports) > 0 && len(sourceInfo.Protocols) > 0 {
+			ingressRule.ToPorts = []PortRule{}
+			for protocol := range sourceInfo.Protocols {
+				portRule := PortRule{
+					Protocol: strings.ToUpper(protocol),
+					Ports:    []PortSpec{},
+				}
+				ports := []string{}
+				for port := range sourceInfo.Ports {
+					ports = append(ports, port)
+				}
+				sort.Strings(ports)
+				for _, port := range ports {
+					portRule.Ports = append(portRule.Ports, PortSpec{Port: port})
+				}
+				ingressRule.ToPorts = append(ingressRule.ToPorts, portRule)
+			}
+		}
+
+		if len(ingressRule.FromEndpoints) > 0 || len(ingressRule.FromCIDR) > 0 {
+			if len(sourceInfo.Ports) > 0 || len(ingressRule.FromCIDR) > 0 {
+				policy.Spec.Ingress = append(policy.Spec.Ingress, ingressRule)
+			}
+		}
+	}
+
+	// Add DNS rule if not present
+	hasDNSRule := false
+	for _, rule := range policy.Spec.Egress {
+		for _, endpoint := range rule.ToEndpoints {
+			if endpoint.MatchLabels != nil {
+				if app, ok := endpoint.MatchLabels["k8s-app"]; ok && (app == "kube-dns" || app == "coredns") {
+					hasDNSRule = true
+					break
+				}
+			}
+		}
+		if hasDNSRule {
+			break
+		}
+	}
+
+	if !hasDNSRule {
+		dnsRule := EgressRule{
+			ToEndpoints: []EndpointSelector{{
+				MatchLabels: map[string]string{
+					"io.kubernetes.pod.namespace": "kube-system",
+					"k8s-app":                     "kube-dns",
+				},
+			}},
+			ToPorts: []PortRule{{
+				Protocol: "UDP",
+				Ports:    []PortSpec{{Port: "53"}},
+			}},
+		}
+		policy.Spec.Egress = append(policy.Spec.Egress, dnsRule)
+	}
+
+	// Validate policy
+	if valid, err := hc.validatePolicy(&policy); !valid {
+		fmt.Printf("ОШИБКА валидации политики '%s': %s\n", podName, err)
+		fmt.Println("Политика пропущена. Проверь flows для этого пода.")
+		return
+	}
+
+	filename := fmt.Sprintf("%s-cnp.yaml", hc.sanitizeName(podName))
+	filepath := fmt.Sprintf("%s/%s", outputDir, filename)
+
+	file, err := os.Create(filepath)
+	if err != nil {
+		fmt.Printf("  Error creating policy file '%s': %v\n", filepath, err)
+		return
+	}
+
+	encoder := yaml.NewEncoder(file)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(&policy); err != nil {
+		file.Close()
+		fmt.Printf("  Error encoding policy '%s': %v\n", podName, err)
+		return
+	}
+	file.Close()
+
+	mu.Lock()
+	*policyFiles = append(*policyFiles, filepath)
+	mu.Unlock()
+
+	egressCount := len(policy.Spec.Egress)
+	ingressCount := len(policy.Spec.Ingress)
+	fmt.Printf("Создана политика: %s (egress: %d rules, ingress: %d rules)\n", filepath, egressCount, ingressCount)
+}
+
+
+func (hc *HubbleCollector) sanitizeName(name string) string {
+	// Remove pod hash suffixes using cached regex
+	name = regexPodHash1.ReplaceAllString(name, "")
+	name = regexPodHash2.ReplaceAllString(name, "")
 
 	// Convert to lowercase and replace invalid chars
 	name = strings.ToLower(name)
-	re3 := regexp.MustCompile(`[^a-z0-9-]`)
-	name = re3.ReplaceAllString(name, "-")
+	name = regexInvalidChars.ReplaceAllString(name, "-")
 
 	// Remove duplicate hyphens
-	re4 := regexp.MustCompile(`-+`)
-	name = re4.ReplaceAllString(name, "-")
+	name = regexDuplicateDash.ReplaceAllString(name, "-")
 
 	name = strings.Trim(name, "-")
 
@@ -1422,14 +1458,9 @@ func (hc *HubbleCollector) sanitizeName(name string) string {
 }
 
 func (hc *HubbleCollector) extractLabelsFromPodName(podName string) map[string]string {
-	re1 := regexp.MustCompile(`-[a-f0-9]{8,10}-[a-z0-9]{5}$`)
-	baseName := re1.ReplaceAllString(podName, "")
-
-	re2 := regexp.MustCompile(`-[a-f0-9]{9,10}$`)
-	baseName = re2.ReplaceAllString(baseName, "")
-
-	re3 := regexp.MustCompile(`-\d+$`)
-	baseName = re3.ReplaceAllString(baseName, "")
+	baseName := regexPodHash1.ReplaceAllString(podName, "")
+	baseName = regexPodHash2.ReplaceAllString(baseName, "")
+	baseName = regexStatefulSet.ReplaceAllString(baseName, "")
 
 	if baseName != "" && baseName != podName {
 		return map[string]string{"app": baseName}
