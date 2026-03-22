@@ -1,33 +1,33 @@
 # Hubble Network Flow Collector
 
-Инструмент для сбора сетевых взаимодействий между подами через Hubble и автоматической генерации CiliumNetworkPolicy на основе реального трафика.
+A tool for collecting network interactions between pods via Hubble and automatically generating CiliumNetworkPolicy based on real traffic.
 
-## Возможности
+## Features
 
-- Автоматическая генерация egress и ingress правил на основе реального трафика
-- Определение внутренних и внешних IP с использованием Pod CIDR и Service CIDR
-- Автоматическая фильтрация служебных Kubernetes/Cilium labels (включая commit, pod-template-hash и другие)
-- Поддержка внешних источников (LoadBalancer, Ingress Controller)
-- Автоматическое добавление DNS правил
-- Подстановка дефолтных портов для популярных сервисов
-- Валидация политик перед сохранением
+- Automatic generation of egress and ingress rules based on real traffic
+- Detection of internal and external IPs using Pod CIDR and Service CIDR
+- Automatic filtering of Kubernetes/Cilium service labels (including commit, pod-template-hash, and others)
+- Support for external sources (LoadBalancer, Ingress Controller)
+- Automatic DNS rule addition
+- Default port substitution for popular services
+- Policy validation before saving
 
-## Скачивание готовых бинарных файлов
+## Download Pre-built Binaries
 
-Вы можете использовать готовые скомпилированные бинарные файлы для вашей операционной системы:
+You can use pre-built binaries for your operating system:
 
 ### macOS
 
 **Intel (x64):**
 ```bash
-# Скачайте hubble-collector-darwin
+# Download hubble-collector-darwin
 chmod +x hubble-collector-darwin
 ./hubble-collector-darwin -n production -o flows.json
 ```
 
 **Apple Silicon (M1/M2/M3):**
 ```bash
-# Скачайте hubble-collector-darwin-arm64
+# Download hubble-collector-darwin-arm64
 chmod +x hubble-collector-darwin-arm64
 ./hubble-collector-darwin-arm64 -n production -o flows.json
 ```
@@ -35,7 +35,7 @@ chmod +x hubble-collector-darwin-arm64
 ### Linux (AMD64)
 
 ```bash
-# Скачайте hubble-collector-linux
+# Download hubble-collector-linux
 chmod +x hubble-collector-linux
 ./hubble-collector-linux -n production -o flows.json
 ```
@@ -43,26 +43,26 @@ chmod +x hubble-collector-linux
 ### Windows
 
 ```bash
-# Скачайте hubble-collector.exe
+# Download hubble-collector.exe
 hubble-collector.exe -n production -o flows.json
 ```
 
-## Компиляция из исходников (опционально)
+## Build from Source (optional)
 
-Если вы хотите собрать бинарный файл самостоятельно:
+If you want to build the binary yourself:
 
 ```bash
-# Установка зависимостей
+# Install dependencies
 go mod download
 
-# Компиляция
+# Build
 go build -o hubble-collector hubble-collector.go
 
-# Или кросс-компиляция для Linux
+# Or cross-compile for Linux
 GOOS=linux GOARCH=amd64 go build -o hubble-collector-linux hubble-collector.go
 ```
 
-## Требования
+## Requirements
 
 1. Hubble CLI:
 
@@ -77,196 +77,196 @@ tar xzvf hubble-linux-amd64.tar.gz
 sudo mv hubble /usr/local/bin
 ```
 
-2. Port-forward к Hubble Relay (если требуется):
+2. Port-forward to Hubble Relay (if required):
 
 ```bash
 kubectl port-forward -n kube-system svc/hubble-relay 4245:80
 ```
 
-## Использование
+## Usage
 
-### Базовые команды
+### Basic Commands
 
 ```bash
-# Собрать flows за последние 60 секунд
+# Collect flows for the last 60 seconds
 ./hubble-collector -n production -o flows.json
 
-# Собрать flows за 30 минут
+# Collect flows for 30 minutes
 ./hubble-collector -n production -o flows.json --duration 1800
 
-# Непрерывный мониторинг (Ctrl+C для остановки)
+# Continuous monitoring (Ctrl+C to stop)
 ./hubble-collector -n production -o flows.json --follow
 ```
 
-### Генерация CiliumNetworkPolicy
+### Generating CiliumNetworkPolicy
 
 ```bash
-# Собрать flows и создать политики
+# Collect flows and create policies
 ./hubble-collector -n production -o flows.json \
   --cilium true \
   --pod-cidr "10.39.0.0/16" \
   --service-cidr "10.40.0.0/16"
 
-# Для конкретного приложения
+# For a specific application
 ./hubble-collector -n production -o flows.json \
   --from-label "app=backend-api" \
   --cilium true
 
-# Длительный сбор для точности
+# Long collection for better accuracy
 ./hubble-collector -n production -o flows.json \
   --duration 3600 \
   --cilium true
 ```
 
-### Фильтрация
+### Filtering
 
 ```bash
-# По source label
+# By source label
 ./hubble-collector -n dev01 -o flows.json \
   --from-label "app.kubernetes.io/name=notifications-push"
 
-# По destination label
+# By destination label
 ./hubble-collector -n prod -o flows.json \
   --to-label "app=postgres"
 
-# Только заблокированные соединения
+# Only dropped connections
 ./hubble-collector -n prod -o dropped.json --verdict DROPPED
 
-# Комбинация фильтров
+# Combined filters
 ./hubble-collector -n dev01 -o flows.json \
   --from-label "app=api" \
   --to-label "app=database" \
   --verdict FORWARDED
 ```
 
-### Опции
+### Options
 
-| Опция | Описание | По умолчанию |
-|-------|----------|--------------|
-| `-n`, `--namespace` | Namespace для мониторинга | обязательно |
-| `-o`, `--output` | Выходной JSON файл | обязательно |
-| `--duration` | Секунд для сбора flows | 60 |
-| `--follow` | Непрерывный мониторинг | false |
-| `--from-label` | Фильтр по source label | нет |
-| `--to-label` | Фильтр по destination label | нет |
-| `--verdict` | Фильтр по verdict (FORWARDED, DROPPED, ERROR, AUDIT, REDIRECTED, TRACED) | нет |
-| `--cilium` | Создать CiliumNetworkPolicy (true/false) | false |
-| `--cilium-output-dir` | Директория для политик | ./cilium-policies |
-| `--pod-cidr` | Pod CIDR кластера (критично для корректных политик) | 10.39.0.0/16 |
-| `--service-cidr` | Service CIDR кластера (критично для корректных политик) | 10.40.0.0/16 |
-| `--debug-flows` | Сохранить сырые flows для отладки | нет |
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-n`, `--namespace` | Namespace to monitor | required |
+| `-o`, `--output` | Output JSON file | required |
+| `--duration` | Seconds to collect flows | 60 |
+| `--follow` | Continuous monitoring | false |
+| `--from-label` | Filter by source label | none |
+| `--to-label` | Filter by destination label | none |
+| `--verdict` | Filter by verdict (FORWARDED, DROPPED, ERROR, AUDIT, REDIRECTED, TRACED) | none |
+| `--cilium` | Create CiliumNetworkPolicy (true/false) | false |
+| `--cilium-output-dir` | Directory for policies | ./cilium-policies |
+| `--pod-cidr` | Cluster Pod CIDR (critical for correct policies) | 10.39.0.0/16 |
+| `--service-cidr` | Cluster Service CIDR (critical for correct policies) | 10.40.0.0/16 |
+| `--debug-flows` | Save raw flows for debugging | none |
 
-## Критично важные параметры
+## Critical Parameters
 
-### Pod CIDR и Service CIDR
+### Pod CIDR and Service CIDR
 
-Параметры `--pod-cidr` и `--service-cidr` критически важны для корректной генерации политик.
+The `--pod-cidr` and `--service-cidr` parameters are critical for correct policy generation.
 
-#### Зачем нужны
+#### Why They're Needed
 
-Скрипт должен различать:
-- Pod IP (внутренние IP подов)
-- Service IP (ClusterIP сервисов)
-- Внешние публичные IP
+The script must distinguish between:
+- Pod IPs (internal pod IPs)
+- Service IPs (ClusterIP services)
+- External public IPs
 
-Без указания CIDR скрипт использует стандартные частные сети (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), что может привести к неправильной классификации IP.
+Without specifying CIDRs, the script uses standard private network ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), which may lead to incorrect IP classification.
 
-#### Как узнать CIDR своего кластера
+#### How to Find Your Cluster's CIDR
 
 ```bash
-# Способ 1: Через kube-controller-manager
+# Method 1: Via kube-controller-manager
 kubectl -n kube-system get pod -l component=kube-controller-manager -o yaml | grep -E "cluster-cidr|service-cluster-ip-range"
 
-# Пример вывода:
+# Example output:
 #   - --cluster-cidr=10.39.0.0/16
 #   - --service-cluster-ip-range=10.40.0.0/16
 
-# Способ 2: Через cluster-info
+# Method 2: Via cluster-info
 kubectl cluster-info dump | grep -m 1 cluster-cidr
 kubectl cluster-info dump | grep -m 1 service-cluster-ip-range
 
-# Способ 3: Из configmap (если есть)
+# Method 3: From configmap (if available)
 kubectl -n kube-system get cm kubeadm-config -o yaml | grep -E "podSubnet|serviceSubnet"
 ```
 
-#### Правильное использование
+#### Correct Usage
 
 ```bash
-# С указанием CIDR (рекомендуется)
+# With CIDR specified (recommended)
 ./hubble-collector -n production -o flows.json \
   --cilium true \
   --pod-cidr "10.39.0.0/16" \
   --service-cidr "10.40.0.0/16"
 ```
 
-#### Что будет без указания CIDR
+#### What Happens Without CIDR
 
-Если не указать `--pod-cidr` и `--service-cidr`, скрипт использует дефолтные диапазоны:
+If `--pod-cidr` and `--service-cidr` are not specified, the script uses default ranges:
 - 10.39.0.0/16 (Pod CIDR)
 - 10.40.0.0/16 (Service CIDR)
 - 172.16.0.0/12 (RFC1918)
 - 192.168.0.0/16 (RFC1918)
-- 100.64.0.0/10 (Shared address)
+- 100.64.0.0/10 (Shared address space)
 
-Это подходит для большинства кластеров, но если ваши CIDR отличаются:
-1. IP могут быть неправильно классифицированы
-2. Создаются правила `toCIDR` вместо `toEndpoints`
-3. Политики становятся нестабильными (ломаются при рестарте подов)
+This works for most clusters, but if your CIDRs differ:
+1. IPs may be misclassified
+2. `toCIDR` rules are created instead of `toEndpoints`
+3. Policies become unstable (break when pods restart)
 
-**Пример проблемы:**
+**Example problem:**
 
-Без CIDR:
+Without CIDR:
 ```yaml
 egress:
 - toCIDR:
-  - 10.39.36.20/32  # IP пода - нестабильно!
+  - 10.39.36.20/32  # Pod IP - unstable!
   toPorts:
   - protocol: TCP
     ports:
     - port: '8080'
 ```
 
-С правильным CIDR:
+With correct CIDR:
 ```yaml
 egress:
 - toEndpoints:
   - matchLabels:
-      app: backend-api  # Стабильно, не зависит от IP
+      app: backend-api  # Stable, not dependent on IP
   toPorts:
   - protocol: TCP
     ports:
     - port: '8080'
 ```
 
-### Оптимальная продолжительность сбора
+### Optimal Collection Duration
 
-Параметр `--duration` определяет как долго собирать flows.
+The `--duration` parameter determines how long to collect flows.
 
-#### Рекомендации
+#### Recommendations
 
-| Сценарий | Duration | Причина |
-|----------|----------|---------|
-| Тестирование скрипта | 60-300 сек | Быстрая проверка |
-| Production политики | 300-600 сек | Баланс покрытия и актуальности |
-| Полное покрытие | 1800-3600 сек | Все сценарии, но риск мёртвых подов |
-| Живые поды только | 300 сек | Минимум мёртвых IP |
+| Scenario | Duration | Reason |
+|----------|----------|--------|
+| Script testing | 60-300 sec | Quick check |
+| Production policies | 300-600 sec | Balance of coverage and relevance |
+| Full coverage | 1800-3600 sec | All scenarios, but risk of dead pods |
+| Live pods only | 300 sec | Minimum dead IPs |
 
-#### Проблема мёртвых подов
+#### Dead Pod Problem
 
-Hubble хранит исторические flows. Если за время `--duration`:
-- Под был удалён
-- Под перезапустился и получил новый IP
+Hubble stores historical flows. If during `--duration`:
+- A pod was deleted
+- A pod restarted and got a new IP
 
-То скрипт увидит flows со старым IP, но пода с таким IP уже не будет.
+The script will see flows with the old IP, but no pod with that IP will exist.
 
-**Результат:** Скрипт выведет warning и пропустит такие flows:
+**Result:** The script will print a warning and skip such flows:
 ```
 Warning: unknown internal IP 10.39.36.20 (port 14816) - pod may have been deleted
 ```
 
-#### Рекомендуемый подход
+#### Recommended Approach
 
-Для production используйте короткий период с указанием CIDR:
+For production, use a short period with CIDR specified:
 
 ```bash
 ./hubble-collector -n production -o flows.json \
@@ -276,11 +276,11 @@ Warning: unknown internal IP 10.39.36.20 (port 14816) - pod may have been delete
   --service-cidr "10.40.0.0/16"
 ```
 
-Если нужно больше покрытия - запускайте несколько раз в разное время и объединяйте политики вручную.
+For more coverage — run multiple times at different times and merge policies manually.
 
-#### Режим follow
+#### Follow Mode
 
-Для непрерывного мониторинга используйте `--follow`:
+For continuous monitoring use `--follow`:
 
 ```bash
 ./hubble-collector -n production -o flows.json \
@@ -289,85 +289,85 @@ Warning: unknown internal IP 10.39.36.20 (port 14816) - pod may have been delete
   --pod-cidr "10.39.0.0/16" \
   --service-cidr "10.40.0.0/16"
 
-# Остановите через Ctrl+C когда накопится достаточно flows
+# Stop with Ctrl+C when enough flows have been collected
 ```
 
-## Примеры сценариев
+## Example Scenarios
 
-### 1. Создание политик на основе реального трафика
+### 1. Creating Policies Based on Real Traffic
 
 ```bash
-# Шаг 1: Собрать flows
+# Step 1: Collect flows
 ./hubble-collector -n production -o flows.json \
   --duration 3600 \
   --cilium true \
   --pod-cidr "10.39.0.0/16" \
   --service-cidr "10.40.0.0/16"
 
-# Шаг 2: Проверить созданные политики
+# Step 2: Review created policies
 ls -la ./cilium-policies/
 cat ./cilium-policies/backend-api-cnp.yaml
 
-# Шаг 3: Dry-run применение
+# Step 3: Dry-run apply
 kubectl apply -f ./cilium-policies/ --dry-run=server
 
-# Шаг 4: Применить
+# Step 4: Apply
 kubectl apply -f ./cilium-policies/
 ```
 
-### 2. Аудит сетевых политик
+### 2. Network Policy Audit
 
 ```bash
-# Собрать actual трафик
+# Collect actual traffic
 ./hubble-collector -n production -o actual.json --duration 1800
 
-# Проверить заблокированные соединения
+# Check dropped connections
 ./hubble-collector -n production -o blocked.json --verdict DROPPED
 
-# Найти что блокируется от конкретного сервиса
+# Find what is being blocked from a specific service
 ./hubble-collector -n prod -o api-blocked.json \
   --from-label "app=api" --verdict DROPPED
 ```
 
-### 3. Мониторинг конкретного приложения
+### 3. Monitoring a Specific Application
 
 ```bash
-# Исходящие connections (egress)
+# Outgoing connections (egress)
 ./hubble-collector -n prod -o api-outbound.json \
   --from-label "app=backend-api" --follow
 
-# Входящие connections (ingress)
+# Incoming connections (ingress)
 ./hubble-collector -n prod -o db-clients.json \
   --to-label "app=postgres" --follow
 
-# Полная картина для сервиса
+# Full picture for a service
 ./hubble-collector -n prod -o service-flows.json \
   --from-label "app=api" \
   --cilium true \
   --duration 600
 ```
 
-### 4. Миграция на CiliumNetworkPolicy
+### 4. Migration to CiliumNetworkPolicy
 
 ```bash
-# Шаг 1: Собрать flows
+# Step 1: Collect flows
 ./hubble-collector -n production -o flows.json \
   --duration 7200 --cilium true
 
-# Шаг 2: Применить в test namespace
+# Step 2: Apply in test namespace
 for policy in ./cilium-policies/*.yaml; do
   sed 's/namespace: production/namespace: test/' "$policy" | kubectl apply -f -
 done
 
-# Шаг 3: Мониторить dropped flows
+# Step 3: Monitor dropped flows
 ./hubble-collector -n test -o validation.json \
   --verdict DROPPED --duration 600
 
-# Шаг 4: Если OK, применить в production
+# Step 4: If OK, apply in production
 kubectl apply -f ./cilium-policies/
 ```
 
-## Формат вывода
+## Output Format
 
 ### JSON (connections graph)
 
@@ -391,7 +391,7 @@ kubectl apply -f ./cilium-policies/
 }
 ```
 
-### CiliumNetworkPolicy (автоматически генерируемые)
+### CiliumNetworkPolicy (auto-generated)
 
 ```yaml
 apiVersion: cilium.io/v2
@@ -403,7 +403,7 @@ spec:
   endpointSelector:
     matchLabels:
       app: backend-api
-  
+
   egress:
   - toEndpoints:
     - matchLabels:
@@ -412,14 +412,14 @@ spec:
     - protocol: TCP
       ports:
       - port: "5432"
-  
+
   - toCIDR:
     - "8.8.8.8/32"
     toPorts:
     - protocol: UDP
       ports:
       - port: "53"
-  
+
   - toEndpoints:
     - matchLabels:
         io.kubernetes.pod.namespace: kube-system
@@ -428,7 +428,7 @@ spec:
     - protocol: UDP
       ports:
       - port: "53"
-  
+
   ingress:
   - fromEndpoints:
     - matchLabels:
@@ -437,7 +437,7 @@ spec:
     - protocol: TCP
       ports:
       - port: "8080"
-  
+
   - fromCIDR:
     - "203.0.113.5/32"
     toPorts:
@@ -446,27 +446,27 @@ spec:
       - port: "8080"
 ```
 
-## Как работает генерация политик
+## How Policy Generation Works
 
-Скрипт анализирует flows и автоматически генерирует **egress и ingress правила** на основе реального трафика.
+The script analyzes flows and automatically generates **egress and ingress rules** based on real traffic.
 
-### Egress и Ingress
+### Egress and Ingress
 
-Для каждого пода создаётся комплексная политика:
+A comprehensive policy is created for each pod:
 
-**Egress (исходящий трафик):**
-- Контролирует куда под может подключаться
-- Правила `toEndpoints` для pod-to-pod
-- Правила `toCIDR` для внешних IP
-- Автоматически добавляется DNS
+**Egress (outbound traffic):**
+- Controls where a pod can connect
+- `toEndpoints` rules for pod-to-pod
+- `toCIDR` rules for external IPs
+- DNS is automatically added
 
-**Ingress (входящий трафик):**
-- Контролирует кто может подключаться к поду
-- Правила `fromEndpoints` для pod-to-pod
-- Правила `fromCIDR` для внешних источников (loadbalancer, ingress-controller)
-- Учитывает реальные порты и протоколы
+**Ingress (inbound traffic):**
+- Controls who can connect to the pod
+- `fromEndpoints` rules for pod-to-pod
+- `fromCIDR` rules for external sources (loadbalancer, ingress-controller)
+- Accounts for real ports and protocols
 
-**Пример генерируемой политики:**
+**Example generated policy:**
 
 ```yaml
 apiVersion: cilium.io/v2
@@ -477,7 +477,7 @@ spec:
   endpointSelector:
     matchLabels:
       app: backend-api
-  
+
   egress:
   - toEndpoints:
     - matchLabels:
@@ -486,14 +486,14 @@ spec:
     - protocol: TCP
       ports:
       - port: "5432"
-  
+
   - toCIDR:
     - "8.8.8.8/32"
     toPorts:
     - protocol: UDP
       ports:
       - port: "53"
-  
+
   ingress:
   - fromEndpoints:
     - matchLabels:
@@ -502,7 +502,7 @@ spec:
     - protocol: TCP
       ports:
       - port: "8080"
-  
+
   - fromCIDR:
     - "203.0.113.5/32"
     toPorts:
@@ -511,38 +511,38 @@ spec:
       - port: "8080"
 ```
 
-### Логика определения типа назначения
+### Destination Type Detection Logic
 
-Скрипт умно определяет тип назначения и использует правильные селекторы:
+The script intelligently determines the destination type and uses correct selectors:
 
-| Тип соединения | IP адрес | Egress селектор | Ingress селектор |
-|----------------|----------|----------------|------------------|
-| Pod в том же NS | 10.39.1.20 | toEndpoints + matchLabels | fromEndpoints + matchLabels |
-| Pod в другом NS | 10.39.2.30 | toEndpoints + matchExpressions | fromEndpoints + matchExpressions |
-| Pod по IP | 10.39.3.40 | toEndpoints + matchLabels | fromEndpoints + matchLabels |
-| Внешний API/LB | 8.8.8.8 | toCIDR | fromCIDR |
-| Мёртвый под | 10.39.36.20 | пропускается | пропускается |
+| Connection Type | IP Address | Egress Selector | Ingress Selector |
+|----------------|------------|----------------|-----------------|
+| Pod in same NS | 10.39.1.20 | toEndpoints + matchLabels | fromEndpoints + matchLabels |
+| Pod in other NS | 10.39.2.30 | toEndpoints + matchExpressions | fromEndpoints + matchExpressions |
+| Pod by IP | 10.39.3.40 | toEndpoints + matchLabels | fromEndpoints + matchLabels |
+| External API/LB | 8.8.8.8 | toCIDR | fromCIDR |
+| Dead pod | 10.39.36.20 | skipped | skipped |
 
-### Определение внешних IP
+### External IP Detection
 
-С параметрами `--pod-cidr` и `--service-cidr`:
-- Проверяется реальный CIDR кластера
-- Точная классификация Pod vs External IP
+With `--pod-cidr` and `--service-cidr` parameters:
+- Real cluster CIDR is checked
+- Accurate Pod vs External IP classification
 
-Без параметров (дефолт для типичных кластеров):
+Without parameters (default for typical clusters):
 - 10.39.0.0/16 (Pod CIDR)
 - 10.40.0.0/16 (Service CIDR)
 - 172.16.0.0/12 (RFC1918)
 - 192.168.0.0/16 (RFC1918)
 - 100.64.0.0/10 (Shared address space)
 
-**Важно:** Если ваш кластер использует другие диапазоны, обязательно укажите `--pod-cidr` и `--service-cidr`.
+**Important:** If your cluster uses different ranges, you must specify `--pod-cidr` and `--service-cidr`.
 
-### Генерация Ingress правил
+### Ingress Rule Generation
 
-Скрипт автоматически создаёт ingress правила на основе flows:
+The script automatically creates ingress rules based on flows:
 
-**Внешние источники (LoadBalancer, Ingress Controller):**
+**External sources (LoadBalancer, Ingress Controller):**
 ```yaml
 ingress:
 - fromCIDR:
@@ -553,7 +553,7 @@ ingress:
     - port: "8080"
 ```
 
-**Внутренние источники (pod-to-pod):**
+**Internal sources (pod-to-pod):**
 ```yaml
 ingress:
 - fromEndpoints:
@@ -565,17 +565,17 @@ ingress:
     - port: "8080"
 ```
 
-**Преимущества:**
-- Полная изоляция (контроль входящего и исходящего трафика)
-- Защита от несанкционированных подключений
-- Явное разрешение для LoadBalancer и Ingress Controller
-- Автоматическая синхронизация egress и ingress (из одних flows)
+**Benefits:**
+- Full isolation (control of both inbound and outbound traffic)
+- Protection from unauthorized connections
+- Explicit allowance for LoadBalancer and Ingress Controller
+- Automatic egress and ingress synchronization (from the same flows)
 
-### Дефолтные порты для инфраструктуры
+### Default Ports for Infrastructure
 
-Если Hubble не может определить порт (например, соединение прервалось до установки), скрипт автоматически подставляет известные порты для популярных компонентов:
+If Hubble cannot determine the port (e.g., connection was interrupted before establishment), the script automatically substitutes known ports for popular components:
 
-| Компонент | Порт | Протокол |
+| Component | Port | Protocol |
 |-----------|------|----------|
 | RabbitMQ | 5672 | TCP |
 | RabbitMQ Management | 15672 | TCP |
@@ -592,157 +592,157 @@ ingress:
 | Grafana | 3000 | TCP |
 | DNS (kube-dns, coredns) | 53 | UDP |
 
-**Определение по labels:**
-Скрипт анализирует `app`, `app.kubernetes.io/name`, `app.kubernetes.io/component`, `k8s-app` для подстановки дефолтного порта.
+**Detection by labels:**
+The script analyzes `app`, `app.kubernetes.io/name`, `app.kubernetes.io/component`, `k8s-app` to substitute the default port.
 
-**Пример:**
+**Example:**
 ```
 Using default port 6379/TCP for pod:dev01/redis-sentinel-0
 Using default port 8429/TCP for ingress from pod:monitoring/vmagent-0
 ```
 
-**Важно:** Дефолтные порты используются только если Hubble не смог определить реальный порт. Если порт известен - используется реальный порт из flows.
+**Important:** Default ports are only used when Hubble could not determine the real port. If the port is known, the real port from flows is used.
 
-### Фильтрация labels
+### Label Filtering
 
-Инструмент автоматически исключает служебные и временные labels из политик:
+The tool automatically excludes service and temporary labels from policies:
 
-**Исключаются:**
-- `io.cilium.*` - служебные Cilium labels
-- `io.kubernetes.pod.*` - внутренние Kubernetes labels
-- `k8s.namespace.labels.*` - namespace metadata
-- `k8s.policy.*` - policy metadata
-- `pod-template-hash` - меняется при каждом deployment
-- `controller-revision-hash` - меняется при обновлении StatefulSet
-- `statefulset.kubernetes.io/pod-name` - специфично для конкретного пода
-- `commit` - уникален для каждой версии деплоймента
+**Excluded:**
+- `io.cilium.*` — Cilium service labels
+- `io.kubernetes.pod.*` — internal Kubernetes labels
+- `k8s.namespace.labels.*` — namespace metadata
+- `k8s.policy.*` — policy metadata
+- `pod-template-hash` — changes with every deployment
+- `controller-revision-hash` — changes on StatefulSet update
+- `statefulset.kubernetes.io/pod-name` — specific to individual pod
+- `commit` — unique to each deployment version
 
-**Используются стабильные пользовательские labels:**
+**Stable user labels are used:**
 - `app`, `version`, `component`, `tier`, `environment`
 - `app.kubernetes.io/name`, `app.kubernetes.io/component`
-- другие пользовательские labels
+- other custom labels
 
-## Применение политик
+## Applying Policies
 
 ```bash
-# Проверка перед применением
+# Validate before applying
 kubectl apply -f ./cilium-policies/ --dry-run=server
 
-# Просмотр конкретной политики
+# View a specific policy
 cat ./cilium-policies/backend-api-cnp.yaml
 
-# Применение
+# Apply
 kubectl apply -f ./cilium-policies/
 
-# Проверка статуса
+# Check status
 kubectl get ciliumnetworkpolicies -n production
 kubectl describe ciliumnetworkpolicy backend-api -n production
 
-# Мониторинг после применения
+# Monitor after applying
 ./hubble-collector -n production -o dropped.json \
   --verdict DROPPED --follow
 ```
 
 ## Troubleshooting
 
-### Ошибка: hubble: command not found
+### Error: hubble: command not found
 
 ```bash
-# Установите Hubble CLI (см. раздел Установка)
+# Install Hubble CLI (see Requirements section)
 which hubble
 ```
 
-### Ошибка: failed to connect to Hubble
+### Error: failed to connect to Hubble
 
 ```bash
-# Проверьте что Hubble Relay запущен
+# Check that Hubble Relay is running
 kubectl get pods -n kube-system | grep hubble
 
 # Port-forward
 kubectl port-forward -n kube-system svc/hubble-relay 4245:80
 ```
 
-### Пустой output (нет flows)
+### Empty Output (no flows)
 
 ```bash
-# Проверьте что в namespace есть трафик
+# Check that the namespace has traffic
 kubectl get pods -n <namespace>
 
-# Проверьте что Hubble видит flows
+# Check that Hubble sees flows
 hubble observe --namespace <namespace> --last 10
 
-# Увеличьте --duration
+# Increase --duration
 ./hubble-collector -n prod -o flows.json --duration 300
 ```
 
-### Нет labels для пода
+### No Labels for Pod
 
 ```
-Skip pod 'some-pod' - нет labels
+Skip pod 'some-pod' - no labels
 ```
 
-Решение: добавьте labels к подам в Deployment/StatefulSet или используйте --from-label для фильтрации.
+Solution: add labels to pods in Deployment/StatefulSet or use `--from-label` for filtering.
 
-### Политика блокирует нужный трафик
+### Policy Blocks Required Traffic
 
 ```bash
-# Удалить политику
+# Delete the policy
 kubectl delete ciliumnetworkpolicy <name> -n <namespace>
 
-# Пересобрать flows с большим периодом
+# Re-collect flows with a longer period
 ./hubble-collector -n production -o flows.json \
   --duration 7200 --cilium true
 ```
 
-## Рекомендации
+## Recommendations
 
-### Период сбора
+### Collection Period
 
-Рекомендуемая продолжительность сбора flows:
+Recommended flow collection duration:
 
 ```bash
-# Тестирование: 5-10 минут
+# Testing: 5-10 minutes
 --duration 300
 
-# Production: 30-60 минут
+# Production: 30-60 minutes
 --duration 1800
 
-# Полное покрытие: 2-4 часа (включая пиковую нагрузку)
+# Full coverage: 2-4 hours (including peak load)
 --duration 7200
 ```
 
-### Фильтрация
+### Filtering
 
-Используйте фильтры для больших namespace:
+Use filters for large namespaces:
 
 ```bash
-# Только конкретное приложение
+# Only a specific application
 --from-label "app=backend-api"
 
-# Только tier
+# Only a tier
 --from-label "tier=backend"
 ```
 
-### Тестирование
+### Testing
 
-Порядок применения политик в production:
+Order of applying policies in production:
 
-1. Применить в test namespace
-2. Мониторить dropped flows
-3. Проверить работоспособность всех сервисов
-4. Проверить работу ingress (LoadBalancer, Ingress Controller)
-5. Применить в production
+1. Apply in test namespace
+2. Monitor dropped flows
+3. Verify all services work correctly
+4. Verify ingress works (LoadBalancer, Ingress Controller)
+5. Apply in production
 
-### Мониторинг после применения
+### Monitoring After Applying
 
 ```bash
-# Мониторинг dropped flows после применения
+# Monitor dropped flows after applying
 ./hubble-collector -n production -o dropped.json \
   --verdict DROPPED --follow
 ```
 
+## References
+
 - [Hubble Documentation](https://docs.cilium.io/en/stable/observability/hubble/)
 - [Cilium Network Policies](https://docs.cilium.io/en/stable/policy/)
 - [Network Policy Best Practices](https://kubernetes.io/docs/concepts/services-networking/network-policies/)
-
-
