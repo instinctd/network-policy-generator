@@ -370,7 +370,7 @@ kubectl apply -f ./cilium-policies/
 ## Output Format
 
 ### JSON (connections graph)
-
+2
 ```json
 {
   "namespace": "production",
