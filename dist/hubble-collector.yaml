@@ -1,0 +1,45 @@
+apiVersion: krew.googlecontainertools.github.com/v1alpha2
+kind: Plugin
+metadata:
+  name: hubble-collector
+spec:
+  version: v1.0.0
+  homepage: https://github.com/instinctd/network-policy-generator
+  shortDescription: Collect Hubble network flows and generate CiliumNetworkPolicy
+  description: |
+    Connects to Hubble and collects real network flows between pods,
+    then automatically generates CiliumNetworkPolicy with egress/ingress
+    rules based on observed traffic. Supports filtering by namespace,
+    label, verdict, and follow mode.
+  platforms:
+    - selector:
+        matchLabels:
+          os: linux
+          arch: amd64
+      uri: https://github.com/instinctd/network-policy-generator/releases/download/v1.0.0/kubectl-hubble-collector-linux-amd64.tar.gz
+      sha256: "4d0fed5436094e4178b682f5b91e8d48d833cee8a9202b55c97ea10105bcb202"
+      bin: kubectl-hubble-collector
+
+    - selector:
+        matchLabels:
+          os: darwin
+          arch: amd64
+      uri: https://github.com/instinctd/network-policy-generator/releases/download/v1.0.0/kubectl-hubble-collector-darwin-amd64.tar.gz
+      sha256: "b5a773ddfe86372550a6f42f6990b96e0e9df1e8c64546f7212dfa303b9016c3"
+      bin: kubectl-hubble-collector
+
+    - selector:
+        matchLabels:
+          os: darwin
+          arch: arm64
+      uri: https://github.com/instinctd/network-policy-generator/releases/download/v1.0.0/kubectl-hubble-collector-darwin-arm64.tar.gz
+      sha256: "e0247271ee67a963f1ccabc3eec91fd5b7314469fb2d0773cb32521f2a54955c"
+      bin: kubectl-hubble-collector
+
+    - selector:
+        matchLabels:
+          os: windows
+          arch: amd64
+      uri: https://github.com/instinctd/network-policy-generator/releases/download/v1.0.0/kubectl-hubble-collector-windows-amd64.tar.gz
+      sha256: "cd5197b834995c9b9002b0e32c8f843e198e329cd264ca3b3c2e6220b20f710d"
+      bin: kubectl-hubble-collector.exe

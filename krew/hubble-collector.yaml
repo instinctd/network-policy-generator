@@ -1,0 +1,14 @@
+apiVersion: krew.googlecontainertools.github.com/v1alpha2
+kind: Plugin
+metadata:
+  name: hubble-collector
+spec:
+  version: v0.0.0  # replaced by gen-krew-manifest.sh
+  homepage: https://gitlab.gid.team/devsecops/network-policy-generator
+  shortDescription: Collect Hubble network flows and generate CiliumNetworkPolicy
+  description: |
+    Connects to Hubble and collects real network flows between pods,
+    then automatically generates CiliumNetworkPolicy with egress/ingress
+    rules based on observed traffic. Supports filtering by namespace,
+    label, verdict, and follow mode.
+  platforms: []  # replaced by gen-krew-manifest.sh
