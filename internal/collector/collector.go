@@ -316,7 +316,7 @@ func (hc *HubbleCollector) ExportCiliumPolicies(outputDir string) ([]string, err
 		fmt.Printf("  %d internal IPs could not be resolved to pods/namespaces\n", len(unresolvedIPs))
 	}
 
-	return policy.ExportPolicies(podLabels, policiesByPod, outputDir)
+	return policy.ExportPolicies(podLabels, policiesByPod, outputDir, nil)
 }
 
 // mergePolicies merges src policies into dst. Assumes distinct pod keys per
@@ -345,6 +345,58 @@ func (hc *HubbleCollector) SaveRawFlows(filePath string) error {
 	enc := json.NewEncoder(file)
 	enc.SetIndent("", "  ")
 	return enc.Encode(hc.rawFlows)
+}
+
+// ExportCiliumPoliciesWithClusterDedup is like ExportCiliumPolicies but first
+// loads all live CiliumNetworkPolicy objects from the cluster and skips writing
+// any policy whose spec already matches what is deployed.
+func (hc *HubbleCollector) ExportCiliumPoliciesWithClusterDedup(outputDir string) ([]string, error) {
+	fmt.Println("Loading live CiliumNetworkPolicy objects from cluster...")
+	clusterPolicies, err := k8s.FetchClusterPolicies(hc.commander)
+	if err != nil {
+		fmt.Printf("  Warning: could not load cluster policies (%v); proceeding without cluster-dedup\n", err)
+		return hc.ExportCiliumPolicies(outputDir)
+	}
+	fmt.Printf("  Loaded %d live policies from cluster\n", len(clusterPolicies))
+
+	hc.store.Mu.RLock()
+	flowDetails := hc.store.FlowDetails
+	podLabels := hc.store.PodLabels
+	ipToPod := hc.store.IPToPod
+	ipToNS := hc.store.IPToNamespace
+	hc.store.Mu.RUnlock()
+
+	policiesByPod := make(map[string]*types.PolicyData)
+	unresolvedIPs := make(map[string]bool)
+
+	switch {
+	case hc.allNamespaces || len(hc.namespaces) == 0:
+		p, u := policy.BuildPoliciesFromFlows(
+			flowDetails, "", ipToPod, ipToNS, hc.ipToService, hc.internalNetworks,
+		)
+		mergePolicies(policiesByPod, p)
+		mergeBoolSet(unresolvedIPs, u)
+	case len(hc.namespaces) == 1:
+		p, u := policy.BuildPoliciesFromFlows(
+			flowDetails, hc.namespaces[0], ipToPod, ipToNS, hc.ipToService, hc.internalNetworks,
+		)
+		mergePolicies(policiesByPod, p)
+		mergeBoolSet(unresolvedIPs, u)
+	default:
+		for _, ns := range hc.namespaces {
+			p, u := policy.BuildPoliciesFromFlows(
+				flowDetails, ns, ipToPod, ipToNS, hc.ipToService, hc.internalNetworks,
+			)
+			mergePolicies(policiesByPod, p)
+			mergeBoolSet(unresolvedIPs, u)
+		}
+	}
+
+	if len(unresolvedIPs) > 0 {
+		fmt.Printf("  %d internal IPs could not be resolved to pods/namespaces\n", len(unresolvedIPs))
+	}
+
+	return policy.ExportPolicies(podLabels, policiesByPod, outputDir, clusterPolicies)
 }
 
 // CollectFlowsGRPC connects directly to Hubble Relay via gRPC and streams flows

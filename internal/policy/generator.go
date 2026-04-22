@@ -529,10 +529,18 @@ func ValidatePolicy(policy *types.CiliumNetworkPolicy) (bool, string) {
 
 // WritePolicy writes a CiliumNetworkPolicy to a YAML file with human-readable comments.
 // The file is placed in outputDir/<namespace>/<sanitizedName>-cnp.yaml.
-// If the file already exists on disk, the existing policy is loaded and merged
-// with the incoming policy (rules with matching selectors are combined and
-// their ports de-duplicated) before writing.
-func WritePolicy(policy *types.CiliumNetworkPolicy, baseOutputDir string) (string, error) {
+//
+// Merge-on-write: if the file already exists on disk, existing rules are merged
+// with incoming rules (same-selector rules have their ports de-duplicated).
+//
+// Cluster-dedup: if clusterPolicies is non-nil and the merged spec is identical
+// to what is already deployed in the cluster, the file is not written and an
+// empty path is returned (skipped).
+func WritePolicy(
+	policy *types.CiliumNetworkPolicy,
+	baseOutputDir string,
+	clusterPolicies map[string]*types.CiliumNetworkPolicy,
+) (string, error) {
 	outDir := filepath.Join(baseOutputDir, policy.Metadata.Namespace)
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		return "", err
@@ -541,8 +549,7 @@ func WritePolicy(policy *types.CiliumNetworkPolicy, baseOutputDir string) (strin
 	filename := policy.Metadata.Name + "-cnp.yaml"
 	filePath := filepath.Join(outDir, filename)
 
-	// If a policy file already exists, load it and merge the incoming rules
-	// into it instead of overwriting.
+	// Merge with any existing on-disk policy.
 	policyToWrite := policy
 	if _, err := os.Stat(filePath); err == nil {
 		existingBytes, readErr := os.ReadFile(filePath)
@@ -554,6 +561,16 @@ func WritePolicy(policy *types.CiliumNetworkPolicy, baseOutputDir string) (strin
 			return "", fmt.Errorf("unmarshal existing policy %s: %w", filePath, unmarshalErr)
 		}
 		policyToWrite = mergePolicies(&existing, policy)
+	}
+
+	// Cluster-dedup: skip if the spec already matches what is live in the cluster.
+	if clusterPolicies != nil {
+		key := policy.Metadata.Namespace + "/" + policy.Metadata.Name
+		if live, ok := clusterPolicies[key]; ok {
+			if reflect.DeepEqual(live.Spec, policyToWrite.Spec) {
+				return "", nil // already up-to-date in cluster
+			}
+		}
 	}
 
 	// Marshal to YAML with 2-space indent.
@@ -803,10 +820,14 @@ func describePortRules(rules []types.PortRule) string {
 
 // ExportPolicies generates and writes CiliumNetworkPolicy YAML files for all
 // pods in policiesByPod using a worker pool.
+// ExportPolicies builds and writes CiliumNetworkPolicy YAML files for all pods.
+// clusterPolicies may be nil (disables cluster-dedup) or a map from
+// "namespace/name" to the live policy loaded from the cluster.
 func ExportPolicies(
 	allPodLabels map[string]map[string]string,
 	policiesByPod map[string]*types.PolicyData,
 	baseOutputDir string,
+	clusterPolicies map[string]*types.CiliumNetworkPolicy,
 ) ([]string, error) {
 	if err := os.MkdirAll(baseOutputDir, 0755); err != nil {
 		return nil, err
@@ -852,9 +873,13 @@ func ExportPolicies(
 					continue
 				}
 
-				filePath, err := WritePolicy(policy, baseOutputDir)
+				filePath, err := WritePolicy(policy, baseOutputDir, clusterPolicies)
 				if err != nil {
 					fmt.Printf("Error writing policy for %q: %v\n", j.podKey, err)
+					continue
+				}
+				if filePath == "" {
+					fmt.Printf("Skipped (matches cluster): %s/%s\n", podNS, podName)
 					continue
 				}
 

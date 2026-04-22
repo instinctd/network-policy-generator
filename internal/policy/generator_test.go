@@ -237,7 +237,7 @@ func TestWritePolicy_CreatesYAMLFile(t *testing.T) {
 		},
 	}
 
-	filePath, err := WritePolicy(policy, dir)
+	filePath, err := WritePolicy(policy, dir, nil)
 	if err != nil {
 		t.Fatalf("WritePolicy error: %v", err)
 	}
@@ -272,7 +272,7 @@ func TestWritePolicy_ContainsComment(t *testing.T) {
 		},
 	}
 
-	filePath, err := WritePolicy(policy, dir)
+	filePath, err := WritePolicy(policy, dir, nil)
 	if err != nil {
 		t.Fatalf("WritePolicy error: %v", err)
 	}

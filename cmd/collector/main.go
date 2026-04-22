@@ -38,6 +38,7 @@ func main() {
 	podCIDR        := flag.String("pod-cidr", "", "Pod CIDR (e.g. 10.244.0.0/16)")
 	serviceCIDR    := flag.String("service-cidr", "", "Service CIDR (e.g. 10.96.0.0/12)")
 	server         := flag.String("server", "", "Hubble relay gRPC address (e.g. localhost:4245); empty = auto port-forward, falls back to hubble CLI")
+	clusterDedup   := flag.Bool("cluster-dedup", false, "Skip writing policies whose spec already matches what is deployed in the cluster")
 
 	flag.Parse()
 
@@ -115,11 +116,17 @@ func main() {
 
 	if *cilium == "true" {
 		fmt.Println("\nGenerating CiliumNetworkPolicy...")
-		policyFiles, err := hc.ExportCiliumPolicies(*ciliumOutputDir)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "\nError creating policies: %v\n", err)
+		var policyFiles []string
+		var policyErr error
+		if *clusterDedup {
+			policyFiles, policyErr = hc.ExportCiliumPoliciesWithClusterDedup(*ciliumOutputDir)
 		} else {
-			fmt.Printf("\nCreated %d policy files in %q\n", len(policyFiles), *ciliumOutputDir)
+			policyFiles, policyErr = hc.ExportCiliumPolicies(*ciliumOutputDir)
+		}
+		if policyErr != nil {
+			fmt.Fprintf(os.Stderr, "\nError creating policies: %v\n", policyErr)
+		} else {
+			fmt.Printf("\nCreated/updated %d policy files in %q\n", len(policyFiles), *ciliumOutputDir)
 		}
 	}
 
