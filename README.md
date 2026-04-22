@@ -4,30 +4,33 @@ A tool for collecting network interactions between pods via Hubble and automatic
 
 ## Features
 
+- Native gRPC connection to Hubble Relay (no `hubble` CLI required)
+- Automatic port-forward to `svc/hubble-relay` — no manual setup needed
 - Automatic generation of egress and ingress rules based on real traffic
 - Detection of internal and external IPs using Pod CIDR and Service CIDR
-- Automatic filtering of Kubernetes/Cilium service labels (including commit, pod-template-hash, and others)
+- Multi-namespace support: `-n prod -n staging`
+- Smart label selection: prefers `app.kubernetes.io/name` → `app` → other stable labels
+- Merge-on-write: new rules merged into existing policy files, ports deduplicated
+- Cluster-dedup (`--cluster-dedup`): skips policies already matching live cluster state
+- Unhandled flow summary: skipped flows reported by reason at end of run
+- Automatic filtering of Kubernetes/Cilium service labels (commit, pod-template-hash, etc.)
 - Support for external sources (LoadBalancer, Ingress Controller)
 - Automatic DNS rule addition
-- Default port substitution for popular services
+- Default port substitution for popular infrastructure components
 - Policy validation before saving
 
 ## Download Pre-built Binaries
-
-You can use pre-built binaries for your operating system:
 
 ### macOS
 
 **Intel (x64):**
 ```bash
-# Download kubectl-hubble-collector-darwin-amd64
 chmod +x kubectl-hubble-collector-darwin-amd64
 ./kubectl-hubble-collector-darwin-amd64 -n production -o flows.json
 ```
 
 **Apple Silicon (M1/M2/M3):**
 ```bash
-# Download kubectl-hubble-collector-darwin-arm64
 chmod +x kubectl-hubble-collector-darwin-arm64
 ./kubectl-hubble-collector-darwin-arm64 -n production -o flows.json
 ```
@@ -35,7 +38,6 @@ chmod +x kubectl-hubble-collector-darwin-arm64
 ### Linux (AMD64)
 
 ```bash
-# Download kubectl-hubble-collector-linux-amd64
 chmod +x kubectl-hubble-collector-linux-amd64
 ./kubectl-hubble-collector-linux-amd64 -n production -o flows.json
 ```
@@ -43,19 +45,16 @@ chmod +x kubectl-hubble-collector-linux-amd64
 ### Windows
 
 ```bash
-# Download kubectl-hubble-collector-windows-amd64.exe
 kubectl-hubble-collector-windows-amd64.exe -n production -o flows.json
 ```
 
-## Build from Source (optional)
-
-If you want to build the binary yourself:
+## Build from Source
 
 ```bash
 # Install dependencies
 go mod download
 
-# Build for current platform (recommended)
+# Build for current platform
 make build
 
 # Or manually
@@ -72,31 +71,16 @@ make build-all
 
 ## Requirements
 
-1. Hubble CLI:
-
-```bash
-# macOS
-brew install cilium-cli
-
-# Linux
-HUBBLE_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/hubble/master/stable.txt)
-curl -L --remote-name-all https://github.com/cilium/hubble/releases/download/$HUBBLE_VERSION/hubble-linux-amd64.tar.gz
-tar xzvf hubble-linux-amd64.tar.gz
-sudo mv hubble /usr/local/bin
-```
-
-2. Port-forward to Hubble Relay (if required):
-
-```bash
-kubectl port-forward -n kube-system svc/hubble-relay 4245:80
-```
+- `kubectl` configured with access to the cluster
+- Hubble enabled in the cluster (Cilium with Hubble Relay)
+- `hubble` CLI — optional, used only as fallback if auto port-forward fails
 
 ## Usage
 
 ### Basic Commands
 
 ```bash
-# Collect flows for the last 60 seconds
+# Collect flows for the last 60 seconds (auto port-forward to Hubble Relay)
 ./kubectl-hubble-collector -n production -o flows.json
 
 # Collect flows for 30 minutes
@@ -105,14 +89,20 @@ kubectl port-forward -n kube-system svc/hubble-relay 4245:80
 # Continuous monitoring (Ctrl+C to stop)
 ./kubectl-hubble-collector -n production -o flows.json --follow
 
-# Collect flows across all namespaces
+# Multiple namespaces
+./kubectl-hubble-collector -n production -n staging -o flows.json
+
+# All namespaces
 ./kubectl-hubble-collector -A -o flows.json
+
+# Connect to Hubble Relay directly (skip auto port-forward)
+./kubectl-hubble-collector -n production -o flows.json --server localhost:4245
 ```
 
 ### Generating CiliumNetworkPolicy
 
 ```bash
-# Collect flows and create policies
+# Collect flows and generate policies
 ./kubectl-hubble-collector -n production -o flows.json \
   --cilium true \
   --pod-cidr "10.39.0.0/16" \
@@ -123,10 +113,14 @@ kubectl port-forward -n kube-system svc/hubble-relay 4245:80
   --from-label "app=backend-api" \
   --cilium true
 
-# Long collection for better accuracy
-./kubectl-hubble-collector -n production -o flows.json \
-  --duration 3600 \
+# Generate policies across multiple namespaces
+./kubectl-hubble-collector -n production -n staging -o flows.json \
   --cilium true
+
+# Skip policies already matching live cluster state
+./kubectl-hubble-collector -n production -o flows.json \
+  --cilium true \
+  --cluster-dedup
 ```
 
 ### Filtering
@@ -154,19 +148,62 @@ kubectl port-forward -n kube-system svc/hubble-relay 4245:80
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-n` | Namespace to monitor | required (or use `-A`) |
+| `-n` | Namespace to monitor (repeatable: `-n prod -n staging`) | required (or use `-A`) |
 | `-A` | Observe all namespaces | false |
 | `-o` | Output JSON file | required |
+| `--server` | Hubble Relay gRPC address; omit for auto port-forward | auto |
 | `--duration` | Seconds to collect flows | 60 |
-| `--follow` | Continuous monitoring | false |
-| `--from-label` | Filter by source label | none |
-| `--to-label` | Filter by destination label | none |
+| `--follow` | Continuous monitoring until Ctrl+C | false |
+| `--from-label` | Filter by source pod label | none |
+| `--to-label` | Filter by destination pod label | none |
 | `--verdict` | Filter by verdict (FORWARDED, DROPPED, ERROR, AUDIT, REDIRECTED, TRACED) | none |
-| `--cilium` | Create CiliumNetworkPolicy (true/false) | false |
-| `--cilium-output-dir` | Directory for policies | ./cilium-policies |
-| `--pod-cidr` | Cluster Pod CIDR (critical for correct policies) | 10.39.0.0/16 |
-| `--service-cidr` | Cluster Service CIDR (critical for correct policies) | 10.40.0.0/16 |
-| `--debug-flows` | Save raw flows for debugging | none |
+| `--cilium` | Generate CiliumNetworkPolicy files (true/false) | false |
+| `--cilium-output-dir` | Directory for generated policy files | ./cilium-policies |
+| `--cluster-dedup` | Skip policies whose spec already matches live cluster state | false |
+| `--pod-cidr` | Cluster Pod CIDR | 10.39.0.0/16 |
+| `--service-cidr` | Cluster Service CIDR | 10.40.0.0/16 |
+| `--debug-flows` | Save raw flows to this file for debugging | none |
+
+## Hubble Connection
+
+The tool connects to Hubble Relay via gRPC. Three modes, tried in order:
+
+**1. Explicit server (`--server`)**
+```bash
+./kubectl-hubble-collector -n production -o flows.json --server localhost:4245
+```
+Uses the specified address directly. Set this if you already have a port-forward running.
+
+**2. Auto port-forward (default)**
+```bash
+./kubectl-hubble-collector -n production -o flows.json
+```
+Automatically runs `kubectl port-forward -n kube-system svc/hubble-relay <random-port>:80`, waits for it to be ready, then connects. Cleans up on exit. No manual setup required.
+
+**3. Hubble CLI fallback**
+If auto port-forward fails (e.g. `hubble-relay` is not present), the tool falls back to running `hubble observe` as a subprocess. Requires the `hubble` CLI to be installed.
+
+## Cluster-Dedup
+
+`--cluster-dedup` is useful when running the tool repeatedly or from different machines where local policy files may not exist.
+
+```bash
+./kubectl-hubble-collector -n production -o flows.json \
+  --cilium true \
+  --cluster-dedup
+```
+
+Before writing each policy file, the tool fetches all live `CiliumNetworkPolicy` objects from the cluster. If the generated spec matches what is already deployed, the file is skipped:
+
+```
+Loading live CiliumNetworkPolicy objects from cluster...
+  Loaded 12 live policies from cluster
+Skipped (matches cluster): production/backend-api
+Skipped (matches cluster): production/postgres
+Created policy: production/new-service-cnp.yaml (egress: 3, ingress: 1)
+
+Created/updated 1 policy files in "./cilium-policies"
+```
 
 ## Critical Parameters
 
@@ -174,24 +211,32 @@ kubectl port-forward -n kube-system svc/hubble-relay 4245:80
 
 The `--pod-cidr` and `--service-cidr` parameters are critical for correct policy generation.
 
-#### Why They're Needed
-
-The script must distinguish between:
+The tool must distinguish between:
 - Pod IPs (internal pod IPs)
 - Service IPs (ClusterIP services)
 - External public IPs
 
-Without specifying CIDRs, the script uses standard private network ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), which may lead to incorrect IP classification.
+Without specifying CIDRs, the tool uses default ranges:
+- 10.39.0.0/16 (Pod CIDR)
+- 10.40.0.0/16 (Service CIDR)
+- 172.16.0.0/12 (RFC1918)
+- 192.168.0.0/16 (RFC1918)
+- 100.64.0.0/10 (Shared address space)
 
-#### How to Find Your Cluster's CIDR
+If your cluster uses different ranges, specify them explicitly:
+
+```bash
+./kubectl-hubble-collector -n production -o flows.json \
+  --cilium true \
+  --pod-cidr "10.39.0.0/16" \
+  --service-cidr "10.40.0.0/16"
+```
+
+#### How to find your cluster's CIDR
 
 ```bash
 # Method 1: Via kube-controller-manager
 kubectl -n kube-system get pod -l component=kube-controller-manager -o yaml | grep -E "cluster-cidr|service-cluster-ip-range"
-
-# Example output:
-#   - --cluster-cidr=10.39.0.0/16
-#   - --service-cluster-ip-range=10.40.0.0/16
 
 # Method 2: Via cluster-info
 kubectl cluster-info dump | grep -m 1 cluster-cidr
@@ -201,98 +246,38 @@ kubectl cluster-info dump | grep -m 1 service-cluster-ip-range
 kubectl -n kube-system get cm kubeadm-config -o yaml | grep -E "podSubnet|serviceSubnet"
 ```
 
-#### Correct Usage
+#### Effect of wrong CIDRs
 
-```bash
-# With CIDR specified (recommended)
-./kubectl-hubble-collector -n production -o flows.json \
-  --cilium true \
-  --pod-cidr "10.39.0.0/16" \
-  --service-cidr "10.40.0.0/16"
-```
+Without correct CIDRs, pod IPs are treated as external addresses, producing unstable `toCIDR` rules instead of `toEndpoints`:
 
-#### What Happens Without CIDR
-
-If `--pod-cidr` and `--service-cidr` are not specified, the script uses default ranges:
-- 10.39.0.0/16 (Pod CIDR)
-- 10.40.0.0/16 (Service CIDR)
-- 172.16.0.0/12 (RFC1918)
-- 192.168.0.0/16 (RFC1918)
-- 100.64.0.0/10 (Shared address space)
-
-This works for most clusters, but if your CIDRs differ:
-1. IPs may be misclassified
-2. `toCIDR` rules are created instead of `toEndpoints`
-3. Policies become unstable (break when pods restart)
-
-**Example problem:**
-
-Without CIDR:
 ```yaml
+# Wrong (without CIDR):
 egress:
 - toCIDR:
-  - 10.39.36.20/32  # Pod IP - unstable!
-  toPorts:
-  - protocol: TCP
-    ports:
-    - port: '8080'
+  - 10.39.36.20/32  # Pod IP — breaks when pod restarts
 ```
 
-With correct CIDR:
 ```yaml
+# Correct (with CIDR):
 egress:
 - toEndpoints:
   - matchLabels:
-      app: backend-api  # Stable, not dependent on IP
-  toPorts:
-  - protocol: TCP
-    ports:
-    - port: '8080'
+      app: backend-api  # Stable across restarts
 ```
 
 ### Optimal Collection Duration
 
-The `--duration` parameter determines how long to collect flows.
-
-#### Recommendations
-
 | Scenario | Duration | Reason |
 |----------|----------|--------|
-| Script testing | 60-300 sec | Quick check |
-| Production policies | 300-600 sec | Balance of coverage and relevance |
-| Full coverage | 1800-3600 sec | All scenarios, but risk of dead pods |
-| Live pods only | 300 sec | Minimum dead IPs |
+| Quick test | 60-300 sec | Fast iteration |
+| Production policies | 300-600 sec | Good coverage without stale pods |
+| Full coverage | 1800-3600 sec | All traffic patterns, risk of dead pods |
 
 #### Dead Pod Problem
 
-Hubble stores historical flows. If during `--duration`:
-- A pod was deleted
-- A pod restarted and got a new IP
-
-The script will see flows with the old IP, but no pod with that IP will exist.
-
-**Result:** The script will print a warning and skip such flows:
-```
-Warning: unknown internal IP 10.39.36.20 (port 14816) - pod may have been deleted
-```
-
-#### Recommended Approach
-
-For production, use a short period with CIDR specified:
-
-```bash
-./kubectl-hubble-collector -n production -o flows.json \
-  --duration 300 \
-  --cilium true \
-  --pod-cidr "10.39.0.0/16" \
-  --service-cidr "10.40.0.0/16"
-```
-
-For more coverage — run multiple times at different times and merge policies manually.
+Hubble stores historical flows. If a pod was restarted during collection, its old IP appears in flows but no longer has a matching pod. The tool skips such flows with a warning and tracks them in the unhandled summary.
 
 #### Follow Mode
-
-For continuous monitoring use `--follow`:
 
 ```bash
 ./kubectl-hubble-collector -n production -o flows.json \
@@ -300,66 +285,74 @@ For continuous monitoring use `--follow`:
   --cilium true \
   --pod-cidr "10.39.0.0/16" \
   --service-cidr "10.40.0.0/16"
-
-# Stop with Ctrl+C when enough flows have been collected
+# Stop with Ctrl+C
 ```
 
 ## Example Scenarios
 
-### 1. Creating Policies Based on Real Traffic
+### 1. Bootstrap Policies from Scratch
 
 ```bash
-# Step 1: Collect flows
+# Step 1: Collect flows for 1 hour
 ./kubectl-hubble-collector -n production -o flows.json \
   --duration 3600 \
   --cilium true \
   --pod-cidr "10.39.0.0/16" \
   --service-cidr "10.40.0.0/16"
 
-# Step 2: Review created policies
-ls -la ./cilium-policies/
-cat ./cilium-policies/backend-api-cnp.yaml
+# Step 2: Review generated policies
+ls -la ./cilium-policies/production/
+cat ./cilium-policies/production/backend-api-cnp.yaml
 
-# Step 3: Dry-run apply
+# Step 3: Dry-run
 kubectl apply -f ./cilium-policies/ --dry-run=server
 
 # Step 4: Apply
 kubectl apply -f ./cilium-policies/
 ```
 
-### 2. Network Policy Audit
+### 2. Iterative Policy Refinement
 
 ```bash
-# Collect actual traffic
+# Collect additional flows and merge into existing policy files
+./kubectl-hubble-collector -n production -o flows.json \
+  --duration 1800 \
+  --cilium true
+
+# New rules are merged into existing files — ports deduplicated automatically
+# Use --cluster-dedup to skip policies already applied to the cluster
+./kubectl-hubble-collector -n production -o flows.json \
+  --duration 1800 \
+  --cilium true \
+  --cluster-dedup
+```
+
+### 3. Network Policy Audit
+
+```bash
+# Collect all allowed traffic
 ./kubectl-hubble-collector -n production -o actual.json --duration 1800
 
-# Check dropped connections
+# Find blocked connections
 ./kubectl-hubble-collector -n production -o blocked.json --verdict DROPPED
 
-# Find what is being blocked from a specific service
+# Find what a specific service is being blocked from
 ./kubectl-hubble-collector -n prod -o api-blocked.json \
   --from-label "app=api" --verdict DROPPED
 ```
 
-### 3. Monitoring a Specific Application
+### 4. Multi-Namespace Policy Generation
 
 ```bash
-# Outgoing connections (egress)
-./kubectl-hubble-collector -n prod -o api-outbound.json \
-  --from-label "app=backend-api" --follow
-
-# Incoming connections (ingress)
-./kubectl-hubble-collector -n prod -o db-clients.json \
-  --to-label "app=postgres" --follow
-
-# Full picture for a service
-./kubectl-hubble-collector -n prod -o service-flows.json \
-  --from-label "app=api" \
+# Generate policies for multiple namespaces in one run
+./kubectl-hubble-collector -n production -n staging -o flows.json \
+  --duration 600 \
   --cilium true \
-  --duration 600
+  --pod-cidr "10.39.0.0/16" \
+  --service-cidr "10.40.0.0/16"
 ```
 
-### 4. Migration to CiliumNetworkPolicy
+### 5. Migration to CiliumNetworkPolicy
 
 ```bash
 # Step 1: Collect flows
@@ -367,15 +360,15 @@ kubectl apply -f ./cilium-policies/
   --duration 7200 --cilium true
 
 # Step 2: Apply in test namespace
-for policy in ./cilium-policies/*.yaml; do
+for policy in ./cilium-policies/production/*.yaml; do
   sed 's/namespace: production/namespace: test/' "$policy" | kubectl apply -f -
 done
 
-# Step 3: Monitor dropped flows
+# Step 3: Check for dropped flows in test
 ./kubectl-hubble-collector -n test -o validation.json \
   --verdict DROPPED --duration 600
 
-# Step 4: If OK, apply in production
+# Step 4: Apply in production
 kubectl apply -f ./cilium-policies/
 ```
 
@@ -390,7 +383,7 @@ kubectl apply -f ./cilium-policies/
   "total_flows": 1234,
   "filters": {
     "from_label": "app=api",
-    "to_label": null,
+    "to_label": "",
     "verdict": "FORWARDED"
   },
   "connections": [
@@ -460,132 +453,56 @@ spec:
 
 ## How Policy Generation Works
 
-The tool analyzes flows and automatically generates **egress and ingress rules** based on real traffic.
+### Label Selection
 
-### Egress and Ingress
+For `matchLabels` in endpoint selectors, stable labels are preferred in order:
 
-A comprehensive policy is created for each pod:
+1. `app.kubernetes.io/name`
+2. `app.kubernetes.io/component`
+3. `app`
+4. All remaining non-system labels (fallback)
 
-**Egress (outbound traffic):**
-- Controls where a pod can connect
-- `toEndpoints` rules for pod-to-pod
-- `toCIDR` rules for external IPs
-- DNS is automatically added
+System labels are always excluded: `io.cilium.*`, `io.kubernetes.pod.*`, `pod-template-hash`, `controller-revision-hash`, `commit`, etc.
 
-**Ingress (inbound traffic):**
-- Controls who can connect to the pod
-- `fromEndpoints` rules for pod-to-pod
-- `fromCIDR` rules for external sources (loadbalancer, ingress-controller)
-- Accounts for real ports and protocols
+### Destination Type Detection
 
-**Example generated policy:**
+| Connection Type | IP Address | Egress Rule | Ingress Rule |
+|----------------|------------|-------------|--------------|
+| Pod in same NS | 10.39.1.20 | `toEndpoints` + `matchLabels` | `fromEndpoints` + `matchLabels` |
+| Pod in other NS | 10.39.2.30 | `toEndpoints` + `matchExpressions` | `fromEndpoints` + `matchExpressions` |
+| External IP | 8.8.8.8 | `toCIDR` | `fromCIDR` |
+| Dead/unknown pod | 10.39.36.20 | skipped | skipped |
 
-```yaml
-apiVersion: cilium.io/v2
-kind: CiliumNetworkPolicy
-metadata:
-  name: backend-api
-spec:
-  endpointSelector:
-    matchLabels:
-      app: backend-api
+### Merge-on-Write
 
-  egress:
-  - toEndpoints:
-    - matchLabels:
-        app: postgres
-    toPorts:
-    - protocol: TCP
-      ports:
-      - port: "5432"
+When a policy file already exists, incoming rules are merged rather than overwriting:
+- Rules with matching selectors have their port lists merged and deduplicated
+- Non-matching rules are appended
+- Metadata (name, namespace) is preserved from the existing file
 
-  - toCIDR:
-    - "8.8.8.8/32"
-    toPorts:
-    - protocol: UDP
-      ports:
-      - port: "53"
+### Unhandled Flow Summary
 
-  ingress:
-  - fromEndpoints:
-    - matchLabels:
-        app: frontend
-    toPorts:
-    - protocol: TCP
-      ports:
-      - port: "8080"
+At the end of each run, a summary of skipped flows is printed:
 
-  - fromCIDR:
-    - "203.0.113.5/32"
-    toPorts:
-    - protocol: TCP
-      ports:
-      - port: "8080"
+```
+Skipped flows summary:
+  empty_namespace:          12
+  nil_endpoint:              3
+  no_l4:                     8
+  world_no_ip:               5
 ```
 
-### Destination Type Detection Logic
-
-The tool intelligently determines the destination type and uses correct selectors:
-
-| Connection Type | IP Address | Egress Selector | Ingress Selector |
-|----------------|------------|----------------|-----------------|
-| Pod in same NS | 10.39.1.20 | toEndpoints + matchLabels | fromEndpoints + matchLabels |
-| Pod in other NS | 10.39.2.30 | toEndpoints + matchExpressions | fromEndpoints + matchExpressions |
-| Pod by IP | 10.39.3.40 | toEndpoints + matchLabels | fromEndpoints + matchLabels |
-| External API/LB | 8.8.8.8 | toCIDR | fromCIDR |
-| Dead pod | 10.39.36.20 | skipped | skipped |
-
-### External IP Detection
-
-With `--pod-cidr` and `--service-cidr` parameters:
-- Real cluster CIDR is checked
-- Accurate Pod vs External IP classification
-
-Without parameters (default for typical clusters):
-- 10.39.0.0/16 (Pod CIDR)
-- 10.40.0.0/16 (Service CIDR)
-- 172.16.0.0/12 (RFC1918)
-- 192.168.0.0/16 (RFC1918)
-- 100.64.0.0/10 (Shared address space)
-
-**Important:** If your cluster uses different ranges, you must specify `--pod-cidr` and `--service-cidr`.
-
-### Ingress Rule Generation
-
-The tool automatically creates ingress rules based on flows:
-
-**External sources (LoadBalancer, Ingress Controller):**
-```yaml
-ingress:
-- fromCIDR:
-  - "203.0.113.5/32"
-  toPorts:
-  - protocol: TCP
-    ports:
-    - port: "8080"
-```
-
-**Internal sources (pod-to-pod):**
-```yaml
-ingress:
-- fromEndpoints:
-  - matchLabels:
-      app: frontend
-  toPorts:
-  - protocol: TCP
-    ports:
-    - port: "8080"
-```
-
-**Benefits:**
-- Full isolation (control of both inbound and outbound traffic)
-- Protection from unauthorized connections
-- Explicit allowance for LoadBalancer and Ingress Controller
-- Automatic egress and ingress synchronization (from the same flows)
+| Reason | Meaning |
+|--------|---------|
+| `nil_endpoint` | Flow has no source or destination endpoint data |
+| `no_l4` | Flow has no L4 (TCP/UDP) information |
+| `empty_namespace` | Both source and destination namespace are empty |
+| `world_no_ip` | External flow with no resolvable IP |
+| `unknown_protocol` | Protocol not supported (e.g. ICMP) |
 
 ### Default Ports for Infrastructure
 
-If Hubble cannot determine the port (e.g., connection was interrupted before establishment), the tool automatically substitutes known ports for popular components:
+When Hubble cannot determine the port, known ports are substituted for popular components:
 
 | Component | Port | Protocol |
 |-----------|------|----------|
@@ -604,44 +521,13 @@ If Hubble cannot determine the port (e.g., connection was interrupted before est
 | Grafana | 3000 | TCP |
 | DNS (kube-dns, coredns) | 53 | UDP |
 
-**Detection by labels:**
-The tool analyzes `app`, `app.kubernetes.io/name`, `app.kubernetes.io/component`, `k8s-app` to substitute the default port.
-
-**Example:**
-```
-Using default port 6379/TCP for pod:dev01/redis-sentinel-0
-Using default port 8429/TCP for ingress from pod:monitoring/vmagent-0
-```
-
-**Important:** Default ports are only used when Hubble could not determine the real port. If the port is known, the real port from flows is used.
-
-### Label Filtering
-
-The tool automatically excludes service and temporary labels from policies:
-
-**Excluded:**
-- `io.cilium.*` — Cilium service labels
-- `io.kubernetes.pod.*` — internal Kubernetes labels
-- `k8s.namespace.labels.*` — namespace metadata
-- `k8s.policy.*` — policy metadata
-- `pod-template-hash` — changes with every deployment
-- `controller-revision-hash` — changes on StatefulSet update
-- `statefulset.kubernetes.io/pod-name` — specific to individual pod
-- `commit` — unique to each deployment version
-
-**Stable user labels are used:**
-- `app`, `version`, `component`, `tier`, `environment`
-- `app.kubernetes.io/name`, `app.kubernetes.io/component`
-- other custom labels
+Detection is based on `app`, `app.kubernetes.io/name`, `app.kubernetes.io/component`, `k8s-app` labels.
 
 ## Applying Policies
 
 ```bash
 # Validate before applying
 kubectl apply -f ./cilium-policies/ --dry-run=server
-
-# View a specific policy
-cat ./cilium-policies/backend-api-cnp.yaml
 
 # Apply
 kubectl apply -f ./cilium-policies/
@@ -650,50 +536,53 @@ kubectl apply -f ./cilium-policies/
 kubectl get ciliumnetworkpolicies -n production
 kubectl describe ciliumnetworkpolicy backend-api -n production
 
-# Monitor after applying
+# Monitor dropped flows after applying
 ./kubectl-hubble-collector -n production -o dropped.json \
   --verdict DROPPED --follow
 ```
 
 ## Troubleshooting
 
-### Error: hubble: command not found
+### Auto port-forward failed
 
-```bash
-# Install Hubble CLI (see Requirements section)
-which hubble
+```
+Auto port-forward failed (...), using hubble CLI
 ```
 
-### Error: failed to connect to Hubble
+Either `hubble-relay` is not running, or `kubectl` is not configured. Check:
 
 ```bash
-# Check that Hubble Relay is running
-kubectl get pods -n kube-system | grep hubble
+kubectl get pods -n kube-system | grep hubble-relay
+kubectl get svc -n kube-system hubble-relay
+```
 
-# Port-forward
+If hubble-relay is running but port-forward still fails, specify the address manually:
+
+```bash
 kubectl port-forward -n kube-system svc/hubble-relay 4245:80
+./kubectl-hubble-collector -n production -o flows.json --server localhost:4245
 ```
 
 ### Empty Output (no flows)
 
 ```bash
-# Check that the namespace has traffic
+# Check namespace has traffic
 kubectl get pods -n <namespace>
 
-# Check that Hubble sees flows
+# Verify Hubble sees flows
 hubble observe --namespace <namespace> --last 10
 
-# Increase --duration
+# Increase collection duration
 ./kubectl-hubble-collector -n prod -o flows.json --duration 300
 ```
 
 ### No Labels for Pod
 
 ```
-Skip pod 'some-pod' - no labels
+Skip pod 'some-pod': no labels
 ```
 
-Solution: add labels to pods in Deployment/StatefulSet or use `--from-label` for filtering.
+Add labels to pods in Deployment/StatefulSet, or use `--from-label` to focus on labeled workloads.
 
 ### Policy Blocks Required Traffic
 
@@ -701,57 +590,29 @@ Solution: add labels to pods in Deployment/StatefulSet or use `--from-label` for
 # Delete the policy
 kubectl delete ciliumnetworkpolicy <name> -n <namespace>
 
-# Re-collect flows with a longer period
+# Re-collect with longer duration to capture all traffic patterns
 ./kubectl-hubble-collector -n production -o flows.json \
   --duration 7200 --cilium true
 ```
 
 ## Recommendations
 
-### Collection Period
-
-Recommended flow collection duration:
+### Collection Duration
 
 ```bash
-# Testing: 5-10 minutes
---duration 300
-
-# Production: 30-60 minutes
---duration 1800
-
-# Full coverage: 2-4 hours (including peak load)
---duration 7200
+--duration 300    # Testing: 5 minutes
+--duration 1800   # Production: 30 minutes
+--duration 7200   # Full coverage: 2 hours (include peak load)
 ```
 
-### Filtering
+### Workflow for Production
 
-Use filters for large namespaces:
-
-```bash
-# Only a specific application
---from-label "app=backend-api"
-
-# Only a tier
---from-label "tier=backend"
-```
-
-### Testing
-
-Order of applying policies in production:
-
-1. Apply in test namespace
-2. Monitor dropped flows
-3. Verify all services work correctly
-4. Verify ingress works (LoadBalancer, Ingress Controller)
+1. Run collection during representative traffic period
+2. Review generated policies before applying
+3. Apply with `--dry-run=server` first
+4. Apply in a test namespace, monitor for dropped flows
 5. Apply in production
-
-### Monitoring After Applying
-
-```bash
-# Monitor dropped flows after applying
-./kubectl-hubble-collector -n production -o dropped.json \
-  --verdict DROPPED --follow
-```
+6. Use `--cluster-dedup` on subsequent runs to track only what changed
 
 ## References
 
