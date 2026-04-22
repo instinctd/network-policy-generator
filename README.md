@@ -20,31 +20,31 @@ You can use pre-built binaries for your operating system:
 
 **Intel (x64):**
 ```bash
-# Download hubble-collector-darwin
-chmod +x hubble-collector-darwin
-./hubble-collector-darwin -n production -o flows.json
+# Download kubectl-hubble-collector-darwin-amd64
+chmod +x kubectl-hubble-collector-darwin-amd64
+./kubectl-hubble-collector-darwin-amd64 -n production -o flows.json
 ```
 
 **Apple Silicon (M1/M2/M3):**
 ```bash
-# Download hubble-collector-darwin-arm64
-chmod +x hubble-collector-darwin-arm64
-./hubble-collector-darwin-arm64 -n production -o flows.json
+# Download kubectl-hubble-collector-darwin-arm64
+chmod +x kubectl-hubble-collector-darwin-arm64
+./kubectl-hubble-collector-darwin-arm64 -n production -o flows.json
 ```
 
 ### Linux (AMD64)
 
 ```bash
-# Download hubble-collector-linux
-chmod +x hubble-collector-linux
-./hubble-collector-linux -n production -o flows.json
+# Download kubectl-hubble-collector-linux-amd64
+chmod +x kubectl-hubble-collector-linux-amd64
+./kubectl-hubble-collector-linux-amd64 -n production -o flows.json
 ```
 
 ### Windows
 
 ```bash
-# Download hubble-collector.exe
-hubble-collector.exe -n production -o flows.json
+# Download kubectl-hubble-collector-windows-amd64.exe
+kubectl-hubble-collector-windows-amd64.exe -n production -o flows.json
 ```
 
 ## Build from Source (optional)
@@ -55,11 +55,19 @@ If you want to build the binary yourself:
 # Install dependencies
 go mod download
 
-# Build
-go build -o hubble-collector hubble-collector.go
+# Build for current platform (recommended)
+make build
 
-# Or cross-compile for Linux
-GOOS=linux GOARCH=amd64 go build -o hubble-collector-linux hubble-collector.go
+# Or manually
+go build -o kubectl-hubble-collector ./cmd/collector
+
+# Cross-compile for Linux
+make build-linux
+# Or manually
+GOOS=linux GOARCH=amd64 go build -o kubectl-hubble-collector-linux-amd64 ./cmd/collector
+
+# Build for all platforms
+make build-all
 ```
 
 ## Requirements
@@ -89,31 +97,34 @@ kubectl port-forward -n kube-system svc/hubble-relay 4245:80
 
 ```bash
 # Collect flows for the last 60 seconds
-./hubble-collector -n production -o flows.json
+./kubectl-hubble-collector -n production -o flows.json
 
 # Collect flows for 30 minutes
-./hubble-collector -n production -o flows.json --duration 1800
+./kubectl-hubble-collector -n production -o flows.json --duration 1800
 
 # Continuous monitoring (Ctrl+C to stop)
-./hubble-collector -n production -o flows.json --follow
+./kubectl-hubble-collector -n production -o flows.json --follow
+
+# Collect flows across all namespaces
+./kubectl-hubble-collector -A -o flows.json
 ```
 
 ### Generating CiliumNetworkPolicy
 
 ```bash
 # Collect flows and create policies
-./hubble-collector -n production -o flows.json \
+./kubectl-hubble-collector -n production -o flows.json \
   --cilium true \
   --pod-cidr "10.39.0.0/16" \
   --service-cidr "10.40.0.0/16"
 
 # For a specific application
-./hubble-collector -n production -o flows.json \
+./kubectl-hubble-collector -n production -o flows.json \
   --from-label "app=backend-api" \
   --cilium true
 
 # Long collection for better accuracy
-./hubble-collector -n production -o flows.json \
+./kubectl-hubble-collector -n production -o flows.json \
   --duration 3600 \
   --cilium true
 ```
@@ -122,18 +133,18 @@ kubectl port-forward -n kube-system svc/hubble-relay 4245:80
 
 ```bash
 # By source label
-./hubble-collector -n dev01 -o flows.json \
+./kubectl-hubble-collector -n dev01 -o flows.json \
   --from-label "app.kubernetes.io/name=notifications-push"
 
 # By destination label
-./hubble-collector -n prod -o flows.json \
+./kubectl-hubble-collector -n prod -o flows.json \
   --to-label "app=postgres"
 
 # Only dropped connections
-./hubble-collector -n prod -o dropped.json --verdict DROPPED
+./kubectl-hubble-collector -n prod -o dropped.json --verdict DROPPED
 
 # Combined filters
-./hubble-collector -n dev01 -o flows.json \
+./kubectl-hubble-collector -n dev01 -o flows.json \
   --from-label "app=api" \
   --to-label "app=database" \
   --verdict FORWARDED
@@ -143,8 +154,9 @@ kubectl port-forward -n kube-system svc/hubble-relay 4245:80
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-n`, `--namespace` | Namespace to monitor | required |
-| `-o`, `--output` | Output JSON file | required |
+| `-n` | Namespace to monitor | required (or use `-A`) |
+| `-A` | Observe all namespaces | false |
+| `-o` | Output JSON file | required |
 | `--duration` | Seconds to collect flows | 60 |
 | `--follow` | Continuous monitoring | false |
 | `--from-label` | Filter by source label | none |
@@ -193,7 +205,7 @@ kubectl -n kube-system get cm kubeadm-config -o yaml | grep -E "podSubnet|servic
 
 ```bash
 # With CIDR specified (recommended)
-./hubble-collector -n production -o flows.json \
+./kubectl-hubble-collector -n production -o flows.json \
   --cilium true \
   --pod-cidr "10.39.0.0/16" \
   --service-cidr "10.40.0.0/16"
@@ -269,7 +281,7 @@ Warning: unknown internal IP 10.39.36.20 (port 14816) - pod may have been delete
 For production, use a short period with CIDR specified:
 
 ```bash
-./hubble-collector -n production -o flows.json \
+./kubectl-hubble-collector -n production -o flows.json \
   --duration 300 \
   --cilium true \
   --pod-cidr "10.39.0.0/16" \
@@ -283,7 +295,7 @@ For more coverage — run multiple times at different times and merge policies m
 For continuous monitoring use `--follow`:
 
 ```bash
-./hubble-collector -n production -o flows.json \
+./kubectl-hubble-collector -n production -o flows.json \
   --follow \
   --cilium true \
   --pod-cidr "10.39.0.0/16" \
@@ -298,7 +310,7 @@ For continuous monitoring use `--follow`:
 
 ```bash
 # Step 1: Collect flows
-./hubble-collector -n production -o flows.json \
+./kubectl-hubble-collector -n production -o flows.json \
   --duration 3600 \
   --cilium true \
   --pod-cidr "10.39.0.0/16" \
@@ -319,13 +331,13 @@ kubectl apply -f ./cilium-policies/
 
 ```bash
 # Collect actual traffic
-./hubble-collector -n production -o actual.json --duration 1800
+./kubectl-hubble-collector -n production -o actual.json --duration 1800
 
 # Check dropped connections
-./hubble-collector -n production -o blocked.json --verdict DROPPED
+./kubectl-hubble-collector -n production -o blocked.json --verdict DROPPED
 
 # Find what is being blocked from a specific service
-./hubble-collector -n prod -o api-blocked.json \
+./kubectl-hubble-collector -n prod -o api-blocked.json \
   --from-label "app=api" --verdict DROPPED
 ```
 
@@ -333,15 +345,15 @@ kubectl apply -f ./cilium-policies/
 
 ```bash
 # Outgoing connections (egress)
-./hubble-collector -n prod -o api-outbound.json \
+./kubectl-hubble-collector -n prod -o api-outbound.json \
   --from-label "app=backend-api" --follow
 
 # Incoming connections (ingress)
-./hubble-collector -n prod -o db-clients.json \
+./kubectl-hubble-collector -n prod -o db-clients.json \
   --to-label "app=postgres" --follow
 
 # Full picture for a service
-./hubble-collector -n prod -o service-flows.json \
+./kubectl-hubble-collector -n prod -o service-flows.json \
   --from-label "app=api" \
   --cilium true \
   --duration 600
@@ -351,7 +363,7 @@ kubectl apply -f ./cilium-policies/
 
 ```bash
 # Step 1: Collect flows
-./hubble-collector -n production -o flows.json \
+./kubectl-hubble-collector -n production -o flows.json \
   --duration 7200 --cilium true
 
 # Step 2: Apply in test namespace
@@ -360,7 +372,7 @@ for policy in ./cilium-policies/*.yaml; do
 done
 
 # Step 3: Monitor dropped flows
-./hubble-collector -n test -o validation.json \
+./kubectl-hubble-collector -n test -o validation.json \
   --verdict DROPPED --duration 600
 
 # Step 4: If OK, apply in production
@@ -370,7 +382,7 @@ kubectl apply -f ./cilium-policies/
 ## Output Format
 
 ### JSON (connections graph)
-2
+
 ```json
 {
   "namespace": "production",
@@ -448,7 +460,7 @@ spec:
 
 ## How Policy Generation Works
 
-The script analyzes flows and automatically generates **egress and ingress rules** based on real traffic.
+The tool analyzes flows and automatically generates **egress and ingress rules** based on real traffic.
 
 ### Egress and Ingress
 
@@ -513,7 +525,7 @@ spec:
 
 ### Destination Type Detection Logic
 
-The script intelligently determines the destination type and uses correct selectors:
+The tool intelligently determines the destination type and uses correct selectors:
 
 | Connection Type | IP Address | Egress Selector | Ingress Selector |
 |----------------|------------|----------------|-----------------|
@@ -540,7 +552,7 @@ Without parameters (default for typical clusters):
 
 ### Ingress Rule Generation
 
-The script automatically creates ingress rules based on flows:
+The tool automatically creates ingress rules based on flows:
 
 **External sources (LoadBalancer, Ingress Controller):**
 ```yaml
@@ -573,7 +585,7 @@ ingress:
 
 ### Default Ports for Infrastructure
 
-If Hubble cannot determine the port (e.g., connection was interrupted before establishment), the script automatically substitutes known ports for popular components:
+If Hubble cannot determine the port (e.g., connection was interrupted before establishment), the tool automatically substitutes known ports for popular components:
 
 | Component | Port | Protocol |
 |-----------|------|----------|
@@ -593,7 +605,7 @@ If Hubble cannot determine the port (e.g., connection was interrupted before est
 | DNS (kube-dns, coredns) | 53 | UDP |
 
 **Detection by labels:**
-The script analyzes `app`, `app.kubernetes.io/name`, `app.kubernetes.io/component`, `k8s-app` to substitute the default port.
+The tool analyzes `app`, `app.kubernetes.io/name`, `app.kubernetes.io/component`, `k8s-app` to substitute the default port.
 
 **Example:**
 ```
@@ -639,7 +651,7 @@ kubectl get ciliumnetworkpolicies -n production
 kubectl describe ciliumnetworkpolicy backend-api -n production
 
 # Monitor after applying
-./hubble-collector -n production -o dropped.json \
+./kubectl-hubble-collector -n production -o dropped.json \
   --verdict DROPPED --follow
 ```
 
@@ -672,7 +684,7 @@ kubectl get pods -n <namespace>
 hubble observe --namespace <namespace> --last 10
 
 # Increase --duration
-./hubble-collector -n prod -o flows.json --duration 300
+./kubectl-hubble-collector -n prod -o flows.json --duration 300
 ```
 
 ### No Labels for Pod
@@ -690,7 +702,7 @@ Solution: add labels to pods in Deployment/StatefulSet or use `--from-label` for
 kubectl delete ciliumnetworkpolicy <name> -n <namespace>
 
 # Re-collect flows with a longer period
-./hubble-collector -n production -o flows.json \
+./kubectl-hubble-collector -n production -o flows.json \
   --duration 7200 --cilium true
 ```
 
@@ -737,7 +749,7 @@ Order of applying policies in production:
 
 ```bash
 # Monitor dropped flows after applying
-./hubble-collector -n production -o dropped.json \
+./kubectl-hubble-collector -n production -o dropped.json \
   --verdict DROPPED --follow
 ```
 
