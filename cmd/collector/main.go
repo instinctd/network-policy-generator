@@ -1,16 +1,30 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 
 	"github.com/network-policy-generator/internal/collector"
 	"github.com/network-policy-generator/internal/k8s"
 )
 
+// multiString is a flag.Value that accumulates repeated flag values.
+type multiString []string
+
+func (m *multiString) String() string { return strings.Join(*m, ",") }
+func (m *multiString) Set(val string) error {
+	*m = append(*m, val)
+	return nil
+}
+
 func main() {
-	namespace      := flag.String("n", "", "Namespace (required unless -A is set)")
+	var namespaces multiString
+	flag.Var(&namespaces, "n", "Namespace (repeatable: -n prod -n staging)")
 	allNamespaces  := flag.Bool("A", false, "Observe all namespaces")
 	output         := flag.String("o", "", "Output JSON file (required)")
 	follow         := flag.Bool("follow", false, "Follow mode (stream until Ctrl-C)")
@@ -23,6 +37,7 @@ func main() {
 	ciliumOutputDir := flag.String("cilium-output-dir", "./cilium-policies", "Directory for generated policies")
 	podCIDR        := flag.String("pod-cidr", "", "Pod CIDR (e.g. 10.244.0.0/16)")
 	serviceCIDR    := flag.String("service-cidr", "", "Service CIDR (e.g. 10.96.0.0/12)")
+	server         := flag.String("server", "", "Hubble relay gRPC address (e.g. localhost:4245); empty = auto port-forward, falls back to hubble CLI")
 
 	flag.Parse()
 
@@ -31,7 +46,7 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
-	if !*allNamespaces && *namespace == "" {
+	if len(namespaces) == 0 && !*allNamespaces {
 		fmt.Fprintln(os.Stderr, "Error: -n (namespace) or -A (all namespaces) is required")
 		flag.Usage()
 		os.Exit(1)
@@ -39,7 +54,7 @@ func main() {
 
 	cmd := k8s.NewExecCommander()
 	hc, err := collector.New(
-		*namespace,
+		[]string(namespaces),
 		*allNamespaces,
 		*fromLabel, *toLabel, *verdict,
 		*podCIDR, *serviceCIDR,
@@ -52,8 +67,10 @@ func main() {
 
 	if *allNamespaces {
 		fmt.Println("Collecting flows from all namespaces...")
+	} else if len(namespaces) == 1 {
+		fmt.Printf("Collecting flows from namespace: %s\n", namespaces[0])
 	} else {
-		fmt.Printf("Collecting flows from namespace: %s\n", *namespace)
+		fmt.Printf("Collecting flows from namespaces: %s\n", strings.Join(namespaces, ", "))
 	}
 	if *fromLabel != "" {
 		fmt.Printf("   From Label: %s\n", *fromLabel)
@@ -65,8 +82,27 @@ func main() {
 		fmt.Printf("   Verdict: %s\n", *verdict)
 	}
 
-	if err := hc.CollectFlows(*duration, *follow, *debugFlows != ""); err != nil {
-		fmt.Fprintf(os.Stderr, "Error collecting flows: %v\n", err)
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	var collectErr error
+	if *server != "" {
+		// Explicit gRPC server address.
+		collectErr = hc.CollectFlowsGRPC(ctx, *server)
+	} else {
+		// Try auto port-forward; fall back to hubble CLI on failure.
+		grpcAddr, cleanup, pfErr := k8s.PortForwardToRelay(ctx)
+		if pfErr == nil {
+			defer cleanup()
+			fmt.Printf("Auto port-forward active: %s\n", grpcAddr)
+			collectErr = hc.CollectFlowsGRPC(ctx, grpcAddr)
+		} else {
+			fmt.Printf("Auto port-forward failed (%v), using hubble CLI\n", pfErr)
+			collectErr = hc.CollectFlows(*duration, *follow, *debugFlows != "")
+		}
+	}
+	if collectErr != nil {
+		fmt.Fprintf(os.Stderr, "Error collecting flows: %v\n", collectErr)
 		os.Exit(1)
 	}
 

@@ -41,7 +41,7 @@ func newFakeCollector(t *testing.T) (*HubbleCollector, *k8s.FakeCommander) {
 		{"redis", "ns1", "10.96.0.10"},
 	})
 
-	hc, err := New("ns1", false, "", "", "", "", "", fake)
+	hc, err := New([]string{"ns1"}, false, "", "", "", "", "", fake)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestExportCiliumPolicies_CreatesFiles(t *testing.T) {
 			"l4":          map[string]interface{}{"TCP": map[string]interface{}{"destination_port": float64(8080)}},
 		},
 	}
-	hc.store.ProcessFlow(flow, "ns1")
+	hc.store.ProcessFlow(flow, []string{"ns1"})
 
 	dir := t.TempDir()
 	files, err := hc.ExportCiliumPolicies(dir)

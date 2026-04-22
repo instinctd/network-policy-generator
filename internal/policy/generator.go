@@ -6,12 +6,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/network-policy-generator/internal/labels"
 	"github.com/network-policy-generator/internal/network"
 	"github.com/network-policy-generator/internal/ports"
 	"github.com/network-policy-generator/internal/types"
@@ -241,17 +243,14 @@ func BuildSinglePolicy(
 	}
 
 	// Remove invalid label prefixes.
-	validLabels := make(map[string]string)
-	for k, v := range podLabels {
-		if !strings.HasPrefix(k, "k8s:") &&
-			!strings.HasPrefix(k, "io.cilium") &&
-			!strings.HasPrefix(k, "io.kubernetes.pod") {
-			validLabels[k] = v
-		}
-	}
+	validLabels := filterValidLabels(podLabels)
 	if len(validLabels) == 0 {
 		return nil, fmt.Errorf("all labels are system labels for pod %q", podName)
 	}
+
+	// Prefer stable well-known labels (app.kubernetes.io/name, etc.) for the
+	// endpoint selector matchLabels.
+	selectorLabels := labels.SelectLabels(validLabels)
 
 	policy := &types.CiliumNetworkPolicy{
 		APIVersion: "cilium.io/v2",
@@ -261,7 +260,7 @@ func BuildSinglePolicy(
 			Namespace: podNS,
 		},
 		Spec: types.PolicySpec{
-			EndpointSelector: types.EndpointSelector{MatchLabels: validLabels},
+			EndpointSelector: types.EndpointSelector{MatchLabels: selectorLabels},
 		},
 	}
 
@@ -331,7 +330,18 @@ func buildEgressRule(
 		destNS, destPod := nsParts[0], nsParts[1]
 		destPodLabels = allPodLabels[destPod]
 		if len(destPodLabels) > 0 {
-			rule.ToEndpoints = []types.EndpointSelector{{MatchLabels: destPodLabels}}
+			validDestLabels := filterValidLabels(destPodLabels)
+			if len(validDestLabels) > 0 {
+				rule.ToEndpoints = []types.EndpointSelector{{MatchLabels: labels.SelectLabels(validDestLabels)}}
+			} else {
+				rule.ToEndpoints = []types.EndpointSelector{{
+					MatchExpressions: []types.MatchExpression{{
+						Key:      "io.kubernetes.pod.namespace",
+						Operator: "In",
+						Values:   []string{destNS},
+					}},
+				}}
+			}
 		} else {
 			rule.ToEndpoints = []types.EndpointSelector{{
 				MatchExpressions: []types.MatchExpression{{
@@ -380,7 +390,18 @@ func buildIngressRule(
 		sourceNS, sourcePod := nsParts[0], nsParts[1]
 		sourcePodLabels = allPodLabels[sourcePod]
 		if len(sourcePodLabels) > 0 {
-			rule.FromEndpoints = []types.EndpointSelector{{MatchLabels: sourcePodLabels}}
+			validSourceLabels := filterValidLabels(sourcePodLabels)
+			if len(validSourceLabels) > 0 {
+				rule.FromEndpoints = []types.EndpointSelector{{MatchLabels: labels.SelectLabels(validSourceLabels)}}
+			} else {
+				rule.FromEndpoints = []types.EndpointSelector{{
+					MatchExpressions: []types.MatchExpression{{
+						Key:      "io.kubernetes.pod.namespace",
+						Operator: "In",
+						Values:   []string{sourceNS},
+					}},
+				}}
+			}
 		} else {
 			rule.FromEndpoints = []types.EndpointSelector{{
 				MatchExpressions: []types.MatchExpression{{
@@ -508,6 +529,9 @@ func ValidatePolicy(policy *types.CiliumNetworkPolicy) (bool, string) {
 
 // WritePolicy writes a CiliumNetworkPolicy to a YAML file with human-readable comments.
 // The file is placed in outputDir/<namespace>/<sanitizedName>-cnp.yaml.
+// If the file already exists on disk, the existing policy is loaded and merged
+// with the incoming policy (rules with matching selectors are combined and
+// their ports de-duplicated) before writing.
 func WritePolicy(policy *types.CiliumNetworkPolicy, baseOutputDir string) (string, error) {
 	outDir := filepath.Join(baseOutputDir, policy.Metadata.Namespace)
 	if err := os.MkdirAll(outDir, 0755); err != nil {
@@ -517,22 +541,150 @@ func WritePolicy(policy *types.CiliumNetworkPolicy, baseOutputDir string) (strin
 	filename := policy.Metadata.Name + "-cnp.yaml"
 	filePath := filepath.Join(outDir, filename)
 
+	// If a policy file already exists, load it and merge the incoming rules
+	// into it instead of overwriting.
+	policyToWrite := policy
+	if _, err := os.Stat(filePath); err == nil {
+		existingBytes, readErr := os.ReadFile(filePath)
+		if readErr != nil {
+			return "", fmt.Errorf("read existing policy %s: %w", filePath, readErr)
+		}
+		var existing types.CiliumNetworkPolicy
+		if unmarshalErr := yaml.Unmarshal(existingBytes, &existing); unmarshalErr != nil {
+			return "", fmt.Errorf("unmarshal existing policy %s: %w", filePath, unmarshalErr)
+		}
+		policyToWrite = mergePolicies(&existing, policy)
+	}
+
 	// Marshal to YAML with 2-space indent.
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)
-	if err := enc.Encode(policy); err != nil {
+	if err := enc.Encode(policyToWrite); err != nil {
 		return "", fmt.Errorf("encode policy: %w", err)
 	}
 	enc.Close()
 
 	// Post-process: insert human-readable comment lines before each rule.
-	annotated := insertRuleComments(buf.Bytes(), policy)
+	annotated := insertRuleComments(buf.Bytes(), policyToWrite)
 
 	if err := os.WriteFile(filePath, annotated, 0644); err != nil {
 		return "", err
 	}
 	return filePath, nil
+}
+
+// mergePolicies combines the rules of an incoming CiliumNetworkPolicy into an
+// existing one. Metadata (name, namespace) is preserved from the existing
+// policy; the EndpointSelector is overwritten with the incoming selector.
+//
+// For both egress and ingress rules, rules are matched by their selector part
+// (everything except ToPorts) using reflect.DeepEqual. When a matching rule is
+// found, port lists are merged and de-duplicated by "port/protocol". Non-
+// matching incoming rules are appended.
+func mergePolicies(existing, incoming *types.CiliumNetworkPolicy) *types.CiliumNetworkPolicy {
+	merged := *existing
+	merged.Spec.EndpointSelector = incoming.Spec.EndpointSelector
+
+	// Merge egress rules.
+	for _, inRule := range incoming.Spec.Egress {
+		matched := false
+		for i := range merged.Spec.Egress {
+			if egressSelectorEqual(merged.Spec.Egress[i], inRule) {
+				merged.Spec.Egress[i].ToPorts = mergePortRules(merged.Spec.Egress[i].ToPorts, inRule.ToPorts)
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			merged.Spec.Egress = append(merged.Spec.Egress, inRule)
+		}
+	}
+
+	// Merge ingress rules.
+	for _, inRule := range incoming.Spec.Ingress {
+		matched := false
+		for i := range merged.Spec.Ingress {
+			if ingressSelectorEqual(merged.Spec.Ingress[i], inRule) {
+				merged.Spec.Ingress[i].ToPorts = mergePortRules(merged.Spec.Ingress[i].ToPorts, inRule.ToPorts)
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			merged.Spec.Ingress = append(merged.Spec.Ingress, inRule)
+		}
+	}
+
+	return &merged
+}
+
+// egressSelectorEqual returns true when two egress rules target the same set
+// of endpoints/CIDRs (ToPorts are intentionally ignored).
+func egressSelectorEqual(a, b types.EgressRule) bool {
+	return reflect.DeepEqual(a.ToEndpoints, b.ToEndpoints) &&
+		reflect.DeepEqual(a.ToCIDR, b.ToCIDR)
+}
+
+// ingressSelectorEqual returns true when two ingress rules source from the
+// same set of endpoints/CIDRs (ToPorts are intentionally ignored).
+func ingressSelectorEqual(a, b types.IngressRule) bool {
+	return reflect.DeepEqual(a.FromEndpoints, b.FromEndpoints) &&
+		reflect.DeepEqual(a.FromCIDR, b.FromCIDR)
+}
+
+// mergePortRules combines two lists of PortRule, de-duplicating ports by
+// "port/protocol". The returned list preserves the order of existing entries
+// and either appends new ports to the appropriate protocol group or creates a
+// new group when the protocol was not previously present.
+func mergePortRules(existing, incoming []types.PortRule) []types.PortRule {
+	if len(incoming) == 0 {
+		return existing
+	}
+
+	// Track all known port/protocol combinations.
+	seen := make(map[string]bool)
+	for _, pr := range existing {
+		for _, p := range pr.Ports {
+			seen[fmt.Sprintf("%s/%s", p.Port, pr.Protocol)] = true
+		}
+	}
+
+	// Index existing rules by protocol so we can append to them in place.
+	protoIdx := make(map[string]int)
+	for i, pr := range existing {
+		protoIdx[pr.Protocol] = i
+	}
+
+	result := existing
+	for _, inPR := range incoming {
+		idx, ok := protoIdx[inPR.Protocol]
+		if !ok {
+			newPR := types.PortRule{Protocol: inPR.Protocol}
+			for _, p := range inPR.Ports {
+				key := fmt.Sprintf("%s/%s", p.Port, inPR.Protocol)
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				newPR.Ports = append(newPR.Ports, p)
+			}
+			if len(newPR.Ports) > 0 {
+				protoIdx[inPR.Protocol] = len(result)
+				result = append(result, newPR)
+			}
+			continue
+		}
+		for _, p := range inPR.Ports {
+			key := fmt.Sprintf("%s/%s", p.Port, inPR.Protocol)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			result[idx].Ports = append(result[idx].Ports, p)
+		}
+	}
+	return result
 }
 
 // insertRuleComments adds a comment line before each egress/ingress rule item
@@ -717,6 +869,21 @@ func ExportPolicies(
 	}
 	wg.Wait()
 	return policyFiles, nil
+}
+
+// filterValidLabels strips system/Cilium label key prefixes that are not
+// permitted in CiliumNetworkPolicy matchLabels.
+func filterValidLabels(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		if strings.HasPrefix(k, "k8s:") ||
+			strings.HasPrefix(k, "io.cilium") ||
+			strings.HasPrefix(k, "io.kubernetes.pod") {
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // sortedKeys returns sorted keys of a map[string]bool.

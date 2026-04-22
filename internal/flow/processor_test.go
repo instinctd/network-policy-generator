@@ -89,7 +89,7 @@ func TestBuildDestPodName_BareIP(t *testing.T) {
 func TestConnectionStore_ProcessFlow_BasicEgressIngress(t *testing.T) {
 	store := NewConnectionStore()
 	flow := makeFlow("ns1", "pod-a", "10.0.0.1", "ns1", "pod-b", "10.0.0.2", 8080, "TCP")
-	store.ProcessFlow(flow, "ns1")
+	store.ProcessFlow(flow, []string{"ns1"})
 
 	// pod-a:8080/TCP (dest with port suffix) should be a connection from pod-a
 	found := false
@@ -106,7 +106,7 @@ func TestConnectionStore_ProcessFlow_BasicEgressIngress(t *testing.T) {
 func TestConnectionStore_ProcessFlow_FiltersByNamespace(t *testing.T) {
 	store := NewConnectionStore()
 	flow := makeFlow("other-ns", "pod-x", "10.0.0.9", "other-ns", "pod-y", "10.0.0.10", 80, "TCP")
-	store.ProcessFlow(flow, "ns1")
+	store.ProcessFlow(flow, []string{"ns1"})
 
 	if len(store.Connections) != 0 {
 		t.Errorf("expected no connections for out-of-namespace flow, got %v", store.Connections)
@@ -116,7 +116,7 @@ func TestConnectionStore_ProcessFlow_FiltersByNamespace(t *testing.T) {
 func TestConnectionStore_ProcessFlow_AllNamespaces(t *testing.T) {
 	store := NewConnectionStore()
 	flow := makeFlow("ns-a", "pod-a", "10.0.0.1", "ns-b", "pod-b", "10.0.0.2", 80, "TCP")
-	store.ProcessFlow(flow, "") // empty namespace = all namespaces
+	store.ProcessFlow(flow, nil) // nil = all namespaces
 
 	if len(store.Connections) == 0 {
 		t.Error("expected connections for all-namespaces mode")
@@ -127,7 +127,7 @@ func TestConnectionStore_ProcessFlow_CountsMultipleFlows(t *testing.T) {
 	store := NewConnectionStore()
 	f := makeFlow("ns1", "pod-a", "10.0.0.1", "ns1", "pod-b", "10.0.0.2", 8080, "TCP")
 	for i := 0; i < 5; i++ {
-		store.ProcessFlow(f, "ns1")
+		store.ProcessFlow(f, []string{"ns1"})
 	}
 
 	var total int
@@ -150,7 +150,7 @@ func TestConnectionStore_ProcessFlow_Concurrent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			store.ProcessFlow(f, "ns1")
+			store.ProcessFlow(f, []string{"ns1"})
 		}()
 	}
 	wg.Wait()
@@ -175,7 +175,7 @@ func TestCollectBatch_ParsesNDJSON(t *testing.T) {
 	fake.Responses["hubble"] = []byte(lines)
 
 	store := NewConnectionStore()
-	count, err := CollectBatch(fake, []string{"observe", "flows"}, store, "ns1")
+	count, err := CollectBatch(fake, []string{"observe", "flows"}, store, []string{"ns1"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -191,7 +191,7 @@ func TestCollectBatch_SkipsMalformedLines(t *testing.T) {
 	fake.Responses["hubble"] = []byte(fmt.Sprintf("not-json\n%s\nnot-json\n", good))
 
 	store := NewConnectionStore()
-	count, err := CollectBatch(fake, []string{"observe", "flows"}, store, "ns1")
+	count, err := CollectBatch(fake, []string{"observe", "flows"}, store, []string{"ns1"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

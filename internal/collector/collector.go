@@ -1,6 +1,7 @@
 package collector
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/network-policy-generator/internal/flow"
+	"github.com/network-policy-generator/internal/hubble"
 	"github.com/network-policy-generator/internal/k8s"
 	"github.com/network-policy-generator/internal/network"
 	"github.com/network-policy-generator/internal/policy"
@@ -18,7 +20,7 @@ import (
 
 // HubbleCollector orchestrates flow collection and policy generation.
 type HubbleCollector struct {
-	namespace     string
+	namespaces    []string
 	allNamespaces bool
 	fromLabel     string
 	toLabel       string
@@ -35,7 +37,7 @@ type HubbleCollector struct {
 
 // New creates a HubbleCollector, loading pod and service IP mappings from kubectl.
 func New(
-	namespace string,
+	namespaces []string,
 	allNamespaces bool,
 	fromLabel, toLabel, verdict string,
 	podCIDR, serviceCIDR string,
@@ -47,7 +49,7 @@ func New(
 	}
 
 	hc := &HubbleCollector{
-		namespace:        namespace,
+		namespaces:       namespaces,
 		allNamespaces:    allNamespaces,
 		fromLabel:        fromLabel,
 		toLabel:          toLabel,
@@ -99,16 +101,25 @@ func New(
 func (hc *HubbleCollector) CollectFlows(duration int, follow bool, captureRaw bool) error {
 	_ = captureRaw // raw capture can be added via ProcessFlow callback if needed
 
-	ns := hc.namespace
+	// Determine the namespace list used for in-process filtering.
+	// When -A is set, or when multiple namespaces are requested, we don't
+	// filter client-side inside a single collection pass (the filter slice
+	// is consumed by ProcessFlow).
+	nsFilter := hc.namespaces
 	if hc.allNamespaces {
-		ns = ""
+		nsFilter = nil
 	}
 
 	args := []string{"observe", "flows", "--output", "json"}
-	if hc.allNamespaces {
+	switch {
+	case hc.allNamespaces:
 		args = append(args, "--all-namespaces")
-	} else {
-		args = append(args, "--namespace", hc.namespace)
+	case len(hc.namespaces) == 1:
+		args = append(args, "--namespace", hc.namespaces[0])
+	default:
+		// Multiple namespaces: hubble has no repeatable --namespace flag,
+		// so fetch everything and rely on ProcessFlow's namespace set filter.
+		args = append(args, "--all-namespaces")
 	}
 	if hc.fromLabel != "" {
 		args = append(args, "--from-label", hc.fromLabel)
@@ -130,9 +141,9 @@ func (hc *HubbleCollector) CollectFlows(duration int, follow bool, captureRaw bo
 	var count int
 	var err error
 	if follow {
-		count, err = flow.CollectStream(hc.commander, args, hc.store, ns)
+		count, err = flow.CollectStream(hc.commander, args, hc.store, nsFilter)
 	} else {
-		count, err = flow.CollectBatch(hc.commander, args, hc.store, ns)
+		count, err = flow.CollectBatch(hc.commander, args, hc.store, nsFilter)
 	}
 	if err != nil {
 		return err
@@ -145,10 +156,13 @@ func (hc *HubbleCollector) CollectFlows(duration int, follow bool, captureRaw bo
 func (hc *HubbleCollector) PrintSummary() {
 	sep := strings.Repeat("=", 70)
 	fmt.Println("\n" + sep)
-	if hc.allNamespaces {
+	switch {
+	case hc.allNamespaces:
 		fmt.Println("Namespace: all")
-	} else {
-		fmt.Printf("Namespace: %s\n", hc.namespace)
+	case len(hc.namespaces) == 1:
+		fmt.Printf("Namespace: %s\n", hc.namespaces[0])
+	default:
+		fmt.Printf("Namespaces: %s\n", strings.Join(hc.namespaces, ", "))
 	}
 	if hc.fromLabel != "" {
 		fmt.Printf("From Label: %s\n", hc.fromLabel)
@@ -190,6 +204,8 @@ func (hc *HubbleCollector) PrintSummary() {
 	}
 	hc.store.Mu.RUnlock()
 	fmt.Println(sep)
+
+	hc.store.Unhandled.Print()
 }
 
 // ExportToJSON writes the connection graph to a JSON file.
@@ -222,8 +238,18 @@ func (hc *HubbleCollector) ExportToJSON(filePath string) error {
 		connections = []map[string]interface{}{}
 	}
 
+	var nsField interface{}
+	switch {
+	case hc.allNamespaces:
+		nsField = ""
+	case len(hc.namespaces) == 1:
+		nsField = hc.namespaces[0]
+	default:
+		nsField = hc.namespaces
+	}
+
 	data := map[string]interface{}{
-		"namespace":    hc.namespace,
+		"namespace":    nsField,
 		"collected_at": time.Now().UTC().Format(time.RFC3339),
 		"total_flows":  hc.flowCount,
 		"filters": map[string]string{
@@ -259,20 +285,54 @@ func (hc *HubbleCollector) ExportCiliumPolicies(outputDir string) ([]string, err
 	ipToNS := hc.store.IPToNamespace
 	hc.store.Mu.RUnlock()
 
-	ns := hc.namespace
-	if hc.allNamespaces {
-		ns = ""
-	}
+	policiesByPod := make(map[string]*types.PolicyData)
+	unresolvedIPs := make(map[string]bool)
 
-	policiesByPod, unresolvedIPs := policy.BuildPoliciesFromFlows(
-		flowDetails, ns, ipToPod, ipToNS, hc.ipToService, hc.internalNetworks,
-	)
+	switch {
+	case hc.allNamespaces || len(hc.namespaces) == 0:
+		p, u := policy.BuildPoliciesFromFlows(
+			flowDetails, "", ipToPod, ipToNS, hc.ipToService, hc.internalNetworks,
+		)
+		mergePolicies(policiesByPod, p)
+		mergeBoolSet(unresolvedIPs, u)
+	case len(hc.namespaces) == 1:
+		p, u := policy.BuildPoliciesFromFlows(
+			flowDetails, hc.namespaces[0], ipToPod, ipToNS, hc.ipToService, hc.internalNetworks,
+		)
+		mergePolicies(policiesByPod, p)
+		mergeBoolSet(unresolvedIPs, u)
+	default:
+		// Build per-namespace, then merge.
+		for _, ns := range hc.namespaces {
+			p, u := policy.BuildPoliciesFromFlows(
+				flowDetails, ns, ipToPod, ipToNS, hc.ipToService, hc.internalNetworks,
+			)
+			mergePolicies(policiesByPod, p)
+			mergeBoolSet(unresolvedIPs, u)
+		}
+	}
 
 	if len(unresolvedIPs) > 0 {
 		fmt.Printf("  %d internal IPs could not be resolved to pods/namespaces\n", len(unresolvedIPs))
 	}
 
 	return policy.ExportPolicies(podLabels, policiesByPod, outputDir)
+}
+
+// mergePolicies merges src policies into dst. Assumes distinct pod keys per
+// namespace, so entries won't collide across different namespace passes.
+func mergePolicies(dst, src map[string]*types.PolicyData) {
+	for k, v := range src {
+		dst[k] = v
+	}
+}
+
+func mergeBoolSet(dst, src map[string]bool) {
+	for k, v := range src {
+		if v {
+			dst[k] = true
+		}
+	}
 }
 
 // SaveRawFlows writes the raw flow JSON array to filePath.
@@ -285,6 +345,42 @@ func (hc *HubbleCollector) SaveRawFlows(filePath string) error {
 	enc := json.NewEncoder(file)
 	enc.SetIndent("", "  ")
 	return enc.Encode(hc.rawFlows)
+}
+
+// CollectFlowsGRPC connects directly to Hubble Relay via gRPC and streams flows
+// until ctx is cancelled. Use this instead of CollectFlows to avoid requiring
+// the hubble CLI binary.
+func (hc *HubbleCollector) CollectFlowsGRPC(ctx context.Context, server string) error {
+	fmt.Printf("Connecting to Hubble Relay via gRPC at %s...\n", server)
+
+	nsFilter := hc.namespaces
+	if hc.allNamespaces {
+		nsFilter = nil
+	}
+
+	client := hubble.NewGRPCClient(server, 30*time.Second)
+	flows, errs := client.StreamFlows(ctx, nsFilter)
+
+	count := 0
+	for {
+		select {
+		case f, ok := <-flows:
+			if !ok {
+				hc.flowCount = count
+				return nil
+			}
+			flowMap := hubble.FlowToMap(f)
+			hc.store.ProcessFlow(flowMap, nsFilter)
+			count++
+		case err := <-errs:
+			if err != nil {
+				return fmt.Errorf("hubble gRPC stream: %w", err)
+			}
+		case <-ctx.Done():
+			hc.flowCount = count
+			return nil
+		}
+	}
 }
 
 // FlowCount returns the total number of flows processed.

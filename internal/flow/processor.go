@@ -19,6 +19,7 @@ type ConnectionStore struct {
 	FlowDetails   map[string]map[string][]types.FlowDetail
 	IPToPod       map[string]types.PodInfo
 	IPToNamespace map[string]string
+	Unhandled     *UnhandledTracker
 	Mu            sync.RWMutex
 }
 
@@ -30,14 +31,17 @@ func NewConnectionStore() *ConnectionStore {
 		FlowDetails:   make(map[string]map[string][]types.FlowDetail),
 		IPToPod:       make(map[string]types.PodInfo),
 		IPToNamespace: make(map[string]string),
+		Unhandled:     NewUnhandledTracker(),
 	}
 }
 
 // ProcessFlow parses a single Hubble flow JSON object and updates the store.
-// namespace is the target namespace filter; pass "" to accept all namespaces.
-func (cs *ConnectionStore) ProcessFlow(flow map[string]interface{}, namespace string) {
+// namespaces is the target namespace filter set; pass an empty slice to
+// accept all namespaces.
+func (cs *ConnectionStore) ProcessFlow(flow map[string]interface{}, namespaces []string) {
 	flowData, ok := flow["flow"].(map[string]interface{})
 	if !ok {
+		cs.Unhandled.Track(ReasonNilEndpoint)
 		return
 	}
 
@@ -45,13 +49,39 @@ func (cs *ConnectionStore) ProcessFlow(flow map[string]interface{}, namespace st
 	destination, _ := flowData["destination"].(map[string]interface{})
 	ipInfo, _ := flowData["IP"].(map[string]interface{})
 
+	if source == nil && destination == nil {
+		cs.Unhandled.Track(ReasonNilEndpoint)
+		return
+	}
+
 	sourceIP := getString(ipInfo, "source", "unknown")
 	destIP := getString(ipInfo, "destination", "unknown")
 	sourceNS := getString(source, "namespace", "")
 	destNS := getString(destination, "namespace", "")
 
-	// Filter: at least one endpoint must be in the target namespace.
-	if namespace != "" && sourceNS != namespace && destNS != namespace {
+	// Filter: at least one endpoint must be in the target namespace set.
+	if len(namespaces) > 0 {
+		nsSet := make(map[string]struct{}, len(namespaces))
+		for _, ns := range namespaces {
+			nsSet[ns] = struct{}{}
+		}
+		_, sourceIn := nsSet[sourceNS]
+		_, destIn := nsSet[destNS]
+		if !sourceIn && !destIn {
+			return
+		}
+	}
+
+	// Skip flows where we have no namespace information on either side.
+	if sourceNS == "" && destNS == "" {
+		cs.Unhandled.Track(ReasonEmptyNamespace)
+		return
+	}
+
+	// Skip external/world flows that lack IP information.
+	if (sourceNS == "" && (sourceIP == "" || sourceIP == "unknown")) ||
+		(destNS == "" && (destIP == "" || destIP == "unknown")) {
+		cs.Unhandled.Track(ReasonWorldNoIP)
 		return
 	}
 
@@ -95,10 +125,21 @@ func (cs *ConnectionStore) ProcessFlow(flow map[string]interface{}, namespace st
 	}
 
 	l4Proto, _ := flowData["l4"].(map[string]interface{})
+	if l4Proto == nil {
+		cs.Unhandled.Track(ReasonNoL4)
+		return
+	}
 	protocol := parseProtocol(l4Proto)
+	if protocol == "unknown" {
+		cs.Unhandled.Track(ReasonUnknownProto)
+		return
+	}
 
 	destPod := destPodName
-	destPort := destination["port"]
+	var destPort interface{}
+	if destination != nil {
+		destPort = destination["port"]
+	}
 	if destPod == "" {
 		destPod = BuildDestPodName(destination, destIP, destPort, l4Proto, protocol)
 	} else if destPort != nil {
@@ -106,6 +147,7 @@ func (cs *ConnectionStore) ProcessFlow(flow map[string]interface{}, namespace st
 	}
 
 	if sourcePod == "" || destPod == "" || sourcePod == destPod {
+		cs.Unhandled.Track(ReasonNilEndpoint)
 		return
 	}
 
@@ -242,7 +284,7 @@ func CollectBatch(
 	cmd k8s.Commander,
 	hubbleArgs []string,
 	store *ConnectionStore,
-	namespace string,
+	namespaces []string,
 ) (int, error) {
 	output, err := cmd.Output("hubble", hubbleArgs...)
 	if err != nil {
@@ -256,7 +298,7 @@ func CollectBatch(
 		}
 		var flow map[string]interface{}
 		if err := json.Unmarshal([]byte(line), &flow); err == nil {
-			store.ProcessFlow(flow, namespace)
+			store.ProcessFlow(flow, namespaces)
 			count++
 		}
 	}
@@ -269,7 +311,7 @@ func CollectStream(
 	cmd k8s.Commander,
 	hubbleArgs []string,
 	store *ConnectionStore,
-	namespace string,
+	namespaces []string,
 ) (int, error) {
 	pipe, waitFn, err := cmd.StdoutPipe("hubble", hubbleArgs...)
 	if err != nil {
@@ -285,7 +327,7 @@ func CollectStream(
 		}
 		var flow map[string]interface{}
 		if err := json.Unmarshal([]byte(line), &flow); err == nil {
-			store.ProcessFlow(flow, namespace)
+			store.ProcessFlow(flow, namespaces)
 			count++
 		}
 	}

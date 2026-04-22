@@ -72,3 +72,25 @@ func FilterK8sLabels(labelsDict map[string]interface{}) map[string]string {
 	}
 	return filtered
 }
+
+// priorityLabelKeys lists well-known label keys in order of preference.
+// When building an endpoint selector, the first matching key wins and is
+// used on its own, producing a stable single-label selector.
+var priorityLabelKeys = []string{
+	"app.kubernetes.io/name",
+	"app.kubernetes.io/component",
+	"app",
+}
+
+// SelectLabels returns a minimal label map for use as matchLabels.
+// If any of the priority keys exists in filtered, a single-entry map
+// containing just that key→value is returned. Otherwise the full
+// filtered map is returned unchanged.
+func SelectLabels(filtered map[string]string) map[string]string {
+	for _, key := range priorityLabelKeys {
+		if value, ok := filtered[key]; ok {
+			return map[string]string{key: value}
+		}
+	}
+	return filtered
+}
